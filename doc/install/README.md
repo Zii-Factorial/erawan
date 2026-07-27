@@ -91,6 +91,18 @@ already runs Ansible jobs and DB TCP-proxying).
   No `global`/`defaults` section is needed in that file — `haproxy.cfg` already
   defines those and they carry over to blocks declared in files loaded after it.
 
+- **Comment out entire blocks, never just the header line.** HAProxy has no
+  concept of a "disabled block" — a `#` only blanks that one line. If you
+  comment `#backend erawan_api` but leave `server api1 127.0.0.1:8080 check`
+  active underneath, that `server` line doesn't vanish — it silently attaches
+  to whatever section was last opened *above* it in the file (e.g.
+  `backend acme_challenge`). Seen in practice: this turned `acme_challenge`
+  into a two-server backend that load-balanced ACME HTTP-01 validation
+  requests between `certbot` and the live API, causing intermittent renewal
+  failures with no obvious error in the HAProxy log. When toggling a block
+  during hand-edits, comment (or delete) every line in it, not just the
+  `frontend`/`backend` header.
+
 ### Public domain (Let's Encrypt via certbot)
 
 Requires a DNS A-record pointing a domain at this host's public IP with ports 80/443
