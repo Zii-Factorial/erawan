@@ -169,6 +169,13 @@ group never opened 80/443.
    # confirm the API's service user can actually read it before moving on
    sudo -u erawan cat /etc/haproxy/certs/erawan-api.pem > /dev/null && echo "OK: erawan can read it"
    ```
+   `chgrp` and `chmod` here are a pair, not alternatives — `chmod 640` alone is a
+   no-op for group access if the file's group is still `root`, and running only
+   `chgrp` leaves the read bit off. Copying just one of the two lines (easy to
+   do when working from chat/scrollback instead of this doc) reproduces the
+   exact `cannot open the file` symptom described above, just less obviously —
+   always finish with the `sudo -u erawan cat ...` check rather than assuming
+   the fix landed.
 
 5. Now append the HTTPS frontend + backend to the same tenants file from step 2:
    ```
