@@ -8,6 +8,9 @@ mysql_gr_autorejoin_tries: 10
 mysql_gr_member_expel_timeout: 5
 mysql_gr_unreachable_majority_timeout: 60
 mysql_gr_exit_state_action: READ_ONLY
+# 128MB is the hard floor for MySQL >= 8.0.21 (below it GR refuses to start);
+# picked to fit the smallest CloudStack plan (512MB RAM).
+mysql_gr_message_cache_size: 134217728
 
 mysql_start_timeout_seconds: 300
 mysqlsh_reset_gr_timeout_seconds: 180

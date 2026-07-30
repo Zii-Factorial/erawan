@@ -158,6 +158,7 @@ loose-group_replication_member_expel_timeout = 5
 loose-group_replication_unreachable_majority_timeout = 60
 loose-group_replication_exit_state_action = READ_ONLY
 loose-group_replication_communication_stack = MYSQL
+loose-group_replication_message_cache_size = 134217728
 loose-group_replication_consistency = BEFORE_ON_PRIMARY_FAILOVER
 relay_log_recovery = ON
 server_id = 1
@@ -175,6 +176,8 @@ ssl_key = /var/lib/mysql/server-key.pem
 **Node 3**: `report_host = 10.0.0.3`, `server_id = 3` — all other lines identical
 
 > `loose-group_replication_start_on_boot = OFF` in this file is intentional for fresh deploys. The `auto_rejoin` role writes `SET PERSIST group_replication_start_on_boot = ON` to `/var/lib/mysql/mysqld-auto.cnf` which takes precedence at runtime.
+
+> `group_replication_message_cache_size` (`mysql_gr_message_cache_size` var, default `134217728` = 128MB) is set to the MySQL-enforced minimum (MySQL >= 8.0.21; below that the floor is 1GB) to fit the smallest CloudStack plan (512MB RAM). The cache structures need ~50MB beyond the configured value, so budget ~180MB for GR alone on a 512MB node. Raise this var for larger plans if XCom cache eviction becomes an issue under heavy write load.
 
 Verify: `sudo cat /etc/mysql/mysql.conf.d/99-erawan-cluster.cnf`
 
