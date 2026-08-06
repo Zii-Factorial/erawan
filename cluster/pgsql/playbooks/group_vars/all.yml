@@ -35,3 +35,7 @@ postgres_exporter_bin: /usr/local/bin/postgres_exporter
 # in Play 2 can open it too, instead of a second ufw-status round trip per node
 # in the exporter-setup play.
 postgres_exporter_port: 9187
+
+# node_exporter ships pre-baked in the VM image (same as postgres_exporter),
+# scraped directly by the erawan control plane — proxy_allowed_ip only.
+node_exporter_port: 9100

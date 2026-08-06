@@ -99,12 +99,15 @@
 # _ufw_status is registered by the imported role above (import_role is a
 # static include, so its tasks — and the vars they register — are inlined
 # here at parse time, no second ufw-status round trip needed).
-- name: Allow postgres_exporter port from control plane only
+- name: Allow exporter ports from control plane only
   community.general.ufw:
     rule: allow
-    port: "{{ postgres_exporter_port | string }}"
+    port: "{{ item | string }}"
     proto: tcp
     src: "{{ proxy_allowed_ip }}"
-    comment: postgres_exporter scraped by erawan control plane
+    comment: exporter scraped by erawan control plane
+  loop:
+    - "{{ postgres_exporter_port }}"
+    - "{{ node_exporter_port }}"
   when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
   tags: ["base_config"]
