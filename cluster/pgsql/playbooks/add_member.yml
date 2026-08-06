@@ -38,7 +38,62 @@
     - pgsql_peer_firewall
 
 # ---------------------------------------------------------------------------
-# PLAY 4 — Install, configure, and start etcd + Patroni on the new node
+# PLAY 4 — Refresh pg_hba in the Patroni DCS config to allow the new member's
+#           replication connection. Unlike UFW rules (re-templated and
+#           re-applied per node), pg_hba is centrally owned by the DCS once
+#           the cluster is bootstrapped — patroni.yml.j2's bootstrap.dcs.pg_hba
+#           only ever takes effect at the cluster's *initial* bootstrap, so it
+#           never sees members added afterward. Without this, the new member's
+#           pg_basebackup against the primary is rejected/dropped and it sits
+#           in "creating replica" forever. Runs once against the primary,
+#           since pg_hba is a single cluster-wide value, not per-node.
+# ---------------------------------------------------------------------------
+- name: Refresh pg_hba for the new member
+  hosts: pgsql_primary
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Get current Patroni DCS config
+      ansible.builtin.uri:
+        url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/config"
+        method: GET
+        url_username: "{{ patroni_admin_user }}"
+        url_password: "{{ patroni_admin_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _current_patroni_config
+      no_log: true
+      run_once: true
+
+    - name: Refresh pg_hba to include the new member
+      ansible.builtin.uri:
+        url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/config"
+        method: PATCH
+        url_username: "{{ patroni_admin_user }}"
+        url_password: "{{ patroni_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          postgresql:
+            pg_hba: >-
+              {{
+                (_current_patroni_config.json.postgresql.pg_hba | default([]))
+                + [
+                    'host replication ' ~ replication_user ~ ' ' ~ new_member_ip ~ '/32 scram-sha-256',
+                    'host all all ' ~ new_member_ip ~ '/32 scram-sha-256'
+                  ]
+              }}
+        status_code: 200
+      no_log: true
+      run_once: true
+      when: >-
+        (new_member_ip ~ '/32') not in
+        ((_current_patroni_config.json.postgresql.pg_hba | default([])) | join('\n'))
+
+# ---------------------------------------------------------------------------
+# PLAY 5 — Install, configure, and start etcd + Patroni on the new node
 #           Uses base_config and configure_node with etcd "existing" state.
 # ---------------------------------------------------------------------------
 - name: Set up new PostgreSQL standby
@@ -55,7 +110,7 @@
     - add_member_join
 
 # ---------------------------------------------------------------------------
-# PLAY 5 — Verify cluster health on all nodes
+# PLAY 6 — Verify cluster health on all nodes
 # ---------------------------------------------------------------------------
 - name: Verify cluster after member addition
   hosts: all
