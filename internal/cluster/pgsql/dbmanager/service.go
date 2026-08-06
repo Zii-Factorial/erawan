@@ -17,8 +17,9 @@ import (
 )
 
 type Service struct {
-	store      pgsql.Store
-	httpClient *http.Client
+	store          pgsql.Store
+	httpClient     *http.Client
+	proxyAllowedIP string
 }
 
 /**
@@ -26,14 +27,18 @@ type Service struct {
  *
  * Params:
  *   store pgsql.Store - the job store.
+ *   proxyAllowedIP string - the HAProxy/control-plane IP that app users
+ *     created/managed through this service are scoped to in pg_hba (see
+ *     PROXY_HOST).
  *
  * Returns:
  *   *Service - the resulting *Service
  */
-func NewService(store pgsql.Store) *Service {
+func NewService(store pgsql.Store, proxyAllowedIP string) *Service {
 	return &Service{
-		store:      store,
-		httpClient: &http.Client{Timeout: 4 * time.Second},
+		store:          store,
+		httpClient:     &http.Client{Timeout: 4 * time.Second},
+		proxyAllowedIP: proxyAllowedIP,
 	}
 }
 
@@ -765,15 +770,16 @@ func (s *Service) revokeInDatabase(ctx context.Context, host string, port int,
 // Patroni DCS pg_hba list. If DCS has no pg_hba yet, the current rules are first
 // seeded from pg_hba_file_rules so existing catch-all rules are preserved.
 func (s *Service) updatePatroniPgHba(ctx context.Context, jobID, username string, ssl bool) error {
+	cidr := s.proxyAllowedIP + "/32"
 	var newRules []string
 	if ssl {
 		newRules = []string{
-			"hostssl all " + username + " 0.0.0.0/0 scram-sha-256",
-			"hostnossl all " + username + " 0.0.0.0/0 reject",
+			"hostssl all " + username + " " + cidr + " scram-sha-256",
+			"hostnossl all " + username + " " + cidr + " reject",
 		}
 	} else {
 		newRules = []string{
-			"host all " + username + " 0.0.0.0/0 scram-sha-256",
+			"host all " + username + " " + cidr + " scram-sha-256",
 		}
 	}
 	return s.patchPatroniPgHba(ctx, jobID, username, newRules)

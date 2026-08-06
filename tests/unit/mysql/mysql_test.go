@@ -365,7 +365,7 @@ func TestDBManagerRejectsInvalidRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
-	db := dbmanager.NewService(store)
+	db := dbmanager.NewService(store, "")
 	ctx := context.Background()
 
 	if err := db.CreateUser(ctx, dbmanager.CreateUserRequest{}); err == nil {
@@ -387,7 +387,7 @@ func TestSetConnectionLimitRejectsInvalidRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
-	db := dbmanager.NewService(store)
+	db := dbmanager.NewService(store, "")
 	ctx := context.Background()
 
 	cases := map[string]dbmanager.SetConnectionLimitRequest{

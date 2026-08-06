@@ -13,7 +13,8 @@ import (
 )
 
 type Service struct {
-	store mysql.Store
+	store          mysql.Store
+	proxyAllowedIP string
 }
 
 /**
@@ -21,11 +22,15 @@ type Service struct {
  *
  * Params:
  *   store mysql.Store - the job store.
+ *   proxyAllowedIP string - the HAProxy/control-plane IP that app users
+ *     created/managed through this service are scoped to (see PROXY_HOST).
  *
  * Returns:
  *   *Service - the resulting *Service
  */
-func NewService(store mysql.Store) *Service { return &Service{store: store} }
+func NewService(store mysql.Store, proxyAllowedIP string) *Service {
+	return &Service{store: store, proxyAllowedIP: proxyAllowedIP}
+}
 
 /**
  * resolve loads primary IP, port, and admin credentials from the stored job.
@@ -89,13 +94,14 @@ func (s *Service) CreateUser(ctx context.Context, req CreateUserRequest) error {
 
 	uid := mysqlID(req.Username)
 	passLit := mysqlLit(req.Password)
+	hostLit := mysqlLit(s.proxyAllowedIP)
 	if _, err := db.ExecContext(ctx,
-		fmt.Sprintf("CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED WITH caching_sha2_password BY %s", uid, passLit),
+		fmt.Sprintf("CREATE USER IF NOT EXISTS %s@%s IDENTIFIED WITH caching_sha2_password BY %s", uid, hostLit, passLit),
 	); err != nil {
 		return fmt.Errorf("create user: %w", err)
 	}
 	if _, err := db.ExecContext(ctx,
-		fmt.Sprintf("ALTER USER %s@'%%' IDENTIFIED WITH caching_sha2_password BY %s", uid, passLit),
+		fmt.Sprintf("ALTER USER %s@%s IDENTIFIED WITH caching_sha2_password BY %s", uid, hostLit, passLit),
 	); err != nil {
 		return fmt.Errorf("update password: %w", err)
 	}
@@ -104,19 +110,19 @@ func (s *Service) CreateUser(ctx context.Context, req CreateUserRequest) error {
 	if req.SSLRequiredEnabled() {
 		sslClause = "REQUIRE SSL"
 	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER USER %s@'%%' %s", uid, sslClause)); err != nil {
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER USER %s@%s %s", uid, hostLit, sslClause)); err != nil {
 		return fmt.Errorf("set ssl requirement: %w", err)
 	}
 
 	if req.Superuser {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(
-			"GRANT ALL PRIVILEGES ON *.* TO %s@'%%' WITH GRANT OPTION", uid),
+			"GRANT ALL PRIVILEGES ON *.* TO %s@%s WITH GRANT OPTION", uid, hostLit),
 		); err != nil {
 			return fmt.Errorf("grant all privileges: %w", err)
 		}
 		for _, priv := range mysqlDynamicPrivs {
 			_, _ = db.ExecContext(ctx, fmt.Sprintf(
-				"GRANT %s ON *.* TO %s@'%%' WITH GRANT OPTION", priv, uid))
+				"GRANT %s ON *.* TO %s@%s WITH GRANT OPTION", priv, uid, hostLit))
 		}
 	} else {
 		if req.DatabaseName != "" {
@@ -133,8 +139,8 @@ func (s *Service) CreateUser(ctx context.Context, req CreateUserRequest) error {
 				}
 			}
 			if _, err := db.ExecContext(ctx, fmt.Sprintf(
-				"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES ON %s.* TO %s@'%%'",
-				mysqlID(req.DatabaseName), uid),
+				"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES ON %s.* TO %s@%s",
+				mysqlID(req.DatabaseName), uid, hostLit),
 			); err != nil {
 				return fmt.Errorf("grant on database: %w", err)
 			}
@@ -194,8 +200,8 @@ func (s *Service) ResetPassword(ctx context.Context, req ResetPasswordRequest) e
 
 	var count int
 	err = db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = '%'",
-		req.Username,
+		"SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = ?",
+		req.Username, s.proxyAllowedIP,
 	).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("lookup user: %w", err)
@@ -209,8 +215,9 @@ func (s *Service) ResetPassword(ctx context.Context, req ResetPasswordRequest) e
 
 	uid := mysqlID(req.Username)
 	passLit := mysqlLit(req.Password)
+	hostLit := mysqlLit(s.proxyAllowedIP)
 	if _, err := db.ExecContext(ctx,
-		fmt.Sprintf("ALTER USER %s@'%%' IDENTIFIED WITH caching_sha2_password BY %s", uid, passLit),
+		fmt.Sprintf("ALTER USER %s@%s IDENTIFIED WITH caching_sha2_password BY %s", uid, hostLit, passLit),
 	); err != nil {
 		return fmt.Errorf("reset password: %w", err)
 	}
@@ -250,8 +257,8 @@ func (s *Service) UpdateUser(ctx context.Context, req UpdateUserRequest) error {
 
 	var count int
 	err = db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = '%'",
-		req.Username,
+		"SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = ?",
+		req.Username, s.proxyAllowedIP,
 	).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("lookup user: %w", err)
@@ -266,9 +273,10 @@ func (s *Service) UpdateUser(ctx context.Context, req UpdateUserRequest) error {
 		return fmt.Errorf("user %q is the cluster admin and cannot be renamed through this API", req.Username)
 	}
 
+	hostLit := mysqlLit(s.proxyAllowedIP)
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		"RENAME USER %s@'%%' TO %s@'%%'",
-		mysqlID(req.Username), mysqlID(req.NewUsername)),
+		"RENAME USER %s@%s TO %s@%s",
+		mysqlID(req.Username), hostLit, mysqlID(req.NewUsername), hostLit),
 	); err != nil {
 		return fmt.Errorf("rename user: %w", err)
 	}
@@ -308,8 +316,8 @@ func (s *Service) DeleteUser(ctx context.Context, req DeleteUserRequest) error {
 
 	var count int
 	err = db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = '%'",
-		req.Username,
+		"SELECT COUNT(*) FROM mysql.user WHERE User = ? AND Host = ?",
+		req.Username, s.proxyAllowedIP,
 	).Scan(&count)
 	if err != nil {
 		return fmt.Errorf("lookup user: %w", err)
@@ -325,7 +333,7 @@ func (s *Service) DeleteUser(ctx context.Context, req DeleteUserRequest) error {
 	}
 
 	if _, err := db.ExecContext(ctx,
-		fmt.Sprintf("DROP USER IF EXISTS %s@'%%'", mysqlID(req.Username)),
+		fmt.Sprintf("DROP USER IF EXISTS %s@%s", mysqlID(req.Username), mysqlLit(s.proxyAllowedIP)),
 	); err != nil {
 		return fmt.Errorf("drop user: %w", err)
 	}
@@ -448,7 +456,7 @@ func (s *Service) UpdateDatabase(ctx context.Context, req UpdateDatabaseRequest)
 	}
 
 	grantRows, err := db.QueryContext(ctx,
-		"SELECT User FROM mysql.db WHERE Db = ? AND Host = '%'", req.DBName)
+		"SELECT User FROM mysql.db WHERE Db = ? AND Host = ?", req.DBName, s.proxyAllowedIP)
 	if err != nil {
 		return fmt.Errorf("list grants: %w", err)
 	}
@@ -466,13 +474,14 @@ func (s *Service) UpdateDatabase(ctx context.Context, req UpdateDatabaseRequest)
 		return fmt.Errorf("list grants: %w", err)
 	}
 
+	hostLit := mysqlLit(s.proxyAllowedIP)
 	for _, u := range grantedUsers {
 		uid := mysqlID(u)
 		_, _ = db.ExecContext(ctx, fmt.Sprintf(
-			"REVOKE ALL PRIVILEGES ON %s.* FROM %s@'%%'", oldID, uid))
+			"REVOKE ALL PRIVILEGES ON %s.* FROM %s@%s", oldID, uid, hostLit))
 		if _, err := db.ExecContext(ctx, fmt.Sprintf(
-			"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES ON %s.* TO %s@'%%'",
-			newID, uid),
+			"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES ON %s.* TO %s@%s",
+			newID, uid, hostLit),
 		); err != nil {
 			return fmt.Errorf("grant on new database to %s: %w", u, err)
 		}
