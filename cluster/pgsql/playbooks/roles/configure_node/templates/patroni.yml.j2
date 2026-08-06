@@ -61,6 +61,14 @@ bootstrap:
     - local all postgres peer
     - local all all peer
     - local replication all peer
+{# Patroni's own heartbeat connection (get_postgresql_status, used to query
+   its local Postgres for WAL/LSN before it will proceed with leader
+   election) connects over TCP to 127.0.0.1, not the Unix socket — the
+   "local" peer entries above don't cover it. Loopback is inherently
+   unreachable from any other host, so this doesn't reopen any of the
+   network-facing access closed elsewhere in this file. #}
+    - host all all 127.0.0.1/32 scram-sha-256
+    - host all all ::1/128 scram-sha-256
 {% if (new_user | default('')) | length > 0 %}
 {% if new_user_ssl_required | default(true) | bool %}
     - hostssl all {{ new_user }} {{ proxy_allowed_ip }}/32 scram-sha-256
