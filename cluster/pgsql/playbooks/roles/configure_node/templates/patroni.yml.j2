@@ -15,7 +15,13 @@ etcd:
 bootstrap:
   dcs:
     ttl: 30
-    loop_wait: 10
+    # Patroni's internal HA loop only re-evaluates/reports state on this
+    # cadence — a new member's /replica endpoint won't flip to 200 until the
+    # next tick after pg_basebackup actually finishes, so this is the single
+    # biggest lever for add-member latency on small datasets. ttl is left
+    # alone: unlike loop_wait, a too-short ttl risks false-positive failover
+    # on a transient network blip, which loop_wait doesn't.
+    loop_wait: 2
     retry_timeout: 10
     maximum_lag_on_failover: 1048576
     synchronous_mode: true
