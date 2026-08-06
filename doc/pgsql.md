@@ -128,6 +128,8 @@ ETCD_INITIAL_CLUSTER_STATE=new
 
 `max_connections` under `bootstrap.dcs.postgresql.parameters` only appears when the deploy request sets `connection_limit` (it is also PATCHed into the Patroni DCS config during `cluster_bootstrap`, so it applies cluster-wide); omitted, PostgreSQL's default of `100` applies.
 
+`shared_buffers`/`effective_cache_size`/`maintenance_work_mem`/`work_mem` are derived from the node's detected RAM (`ansible_memtotal_mb`, gathered by the `runtime_facts` role) using standard pgtune/EDB heuristics, since plain PostgreSQL has no auto-tuning equivalent of MySQL's `innodb_dedicated_server`: `shared_buffers` = 25% of RAM (≈128MB at 512MB RAM, matching PostgreSQL's own built-in default — no regression on the smallest CloudStack plan), `effective_cache_size` = 75% of RAM, `maintenance_work_mem` = 10% of RAM capped at 1GB, `work_mem` = (RAM − shared_buffers) / (16 × vCPUs) floored at PostgreSQL's own 4MB default and capped at 256MB. Like `max_connections`, these only take effect at the cluster's *initial* bootstrap; they're computed per-node but only the value from whichever node actually bootstraps the DCS applies cluster-wide, so this assumes all nodes in a cluster share the same RAM (the normal case — one CloudStack offering per cluster).
+
 ```yaml
 scope: pg-prod
 namespace: /db/
@@ -155,6 +157,10 @@ bootstrap:
         wal_level: replica
         hot_standby: "on"
         max_connections: 200
+        shared_buffers: 8192MB
+        effective_cache_size: 24576MB
+        maintenance_work_mem: 1024MB
+        work_mem: 192MB
         max_wal_senders: 10
         wal_keep_size: 1024
         password_encryption: scram-sha-256

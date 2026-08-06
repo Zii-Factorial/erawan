@@ -29,21 +29,25 @@
     app_user = {{ new_user | to_json }}
     app_pass = {{ new_user_password | to_json }}
     ssl_req  = {{ (new_user_ssl_required | bool) | ternary('True', 'False') }}
+    # The app user is client-facing (reached through HAProxy), unlike
+    # cluster_admin which is used node-to-node for GR management and stays
+    # open to any host -- so this scopes to the proxy IP specifically.
+    proxy_host = {{ proxy_allowed_ip | to_json }}
     edb = db_name.replace("`", "``")
     eu  = app_user.replace("`", "``")
 
     session.run_sql(f"CREATE DATABASE IF NOT EXISTS `{edb}`")
     session.run_sql(
-      f"CREATE USER IF NOT EXISTS `{eu}`@'%' IDENTIFIED WITH caching_sha2_password BY ?", [app_pass]
+      f"CREATE USER IF NOT EXISTS `{eu}`@'{proxy_host}' IDENTIFIED WITH caching_sha2_password BY ?", [app_pass]
     )
     session.run_sql(
-      f"ALTER USER `{eu}`@'%' IDENTIFIED WITH caching_sha2_password BY ?", [app_pass]
+      f"ALTER USER `{eu}`@'{proxy_host}' IDENTIFIED WITH caching_sha2_password BY ?", [app_pass]
     )
-    session.run_sql(f"ALTER USER `{eu}`@'%' {'REQUIRE SSL' if ssl_req else 'REQUIRE NONE'}")
+    session.run_sql(f"ALTER USER `{eu}`@'{proxy_host}' {'REQUIRE SSL' if ssl_req else 'REQUIRE NONE'}")
     superuser = {{ (new_user_superuser | default(false)) | ternary('True', 'False') }}
     if superuser:
-      session.run_sql(f"GRANT ALL PRIVILEGES ON *.* TO `{eu}`@'%' WITH GRANT OPTION")
-      session.run_sql(f"GRANT ALL PRIVILEGES ON `{edb}`.* TO `{eu}`@'%'")
+      session.run_sql(f"GRANT ALL PRIVILEGES ON *.* TO `{eu}`@'{proxy_host}' WITH GRANT OPTION")
+      session.run_sql(f"GRANT ALL PRIVILEGES ON `{edb}`.* TO `{eu}`@'{proxy_host}'")
       dynamic_privs = [
         "AUDIT_ABORT_EXEMPT",
         "AUDIT_ADMIN",
@@ -84,12 +88,12 @@
       ]
       for priv in dynamic_privs:
         try:
-          session.run_sql(f"GRANT {priv} ON *.* TO `{eu}`@'%' WITH GRANT OPTION")
+          session.run_sql(f"GRANT {priv} ON *.* TO `{eu}`@'{proxy_host}' WITH GRANT OPTION")
         except Exception:
           pass
     else:
-      session.run_sql(f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM `{eu}`@'%'")
-      session.run_sql(f"GRANT ALL PRIVILEGES ON `{edb}`.* TO `{eu}`@'%'")
+      session.run_sql(f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM `{eu}`@'{proxy_host}'")
+      session.run_sql(f"GRANT ALL PRIVILEGES ON `{edb}`.* TO `{eu}`@'{proxy_host}'")
 
     session.run_sql("FLUSH PRIVILEGES")
     print("application database and user initialized")

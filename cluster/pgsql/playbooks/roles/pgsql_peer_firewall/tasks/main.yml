@@ -1,0 +1,41 @@
+---
+# Shared by base_config (normal deploy/add-member path) and the add_member
+# "refresh existing peers" play — a single definition so the two call sites
+# can't drift.
+#
+# etcd (client + peer) is pure inter-node traffic: every Patroni node talks to
+# etcd, and it's never reached from the proxy.
+#
+# patroni_rest_port and postgres_port need both sources: patroni_rest_port is
+# HAProxy's httpchk target *and* how Patroni nodes coordinate with each other;
+# postgres_port carries client traffic via the proxy *and* node-to-node
+# streaming replication (the standby connects OUT to the primary to replicate).
+- name: Check UFW availability and status
+  ansible.builtin.command:
+    argv: [ufw, status]
+  register: _ufw_status
+  changed_when: false
+  failed_when: false
+  tags: ["base_config", "pgsql_peer_firewall"]
+
+- name: Allow etcd ports from cluster peers only
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.0 | string }}"
+    proto: tcp
+    src: "{{ item.1 }}"
+    comment: PostgreSQL cluster etcd peer traffic
+  loop: "{{ [etcd_client_port, etcd_peer_port] | product(([primary_ip] + standby_ips) | unique) | list }}"
+  when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
+  tags: ["base_config", "pgsql_peer_firewall"]
+
+- name: Allow Patroni REST and PostgreSQL ports from proxy and cluster peers
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.0 | string }}"
+    proto: tcp
+    src: "{{ item.1 }}"
+    comment: Patroni/PostgreSQL client (via proxy) and inter-node traffic
+  loop: "{{ [patroni_rest_port, postgres_port] | product(([proxy_allowed_ip] + [primary_ip] + standby_ips) | unique) | list }}"
+  when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
+  tags: ["base_config", "pgsql_peer_firewall"]

@@ -1,4 +1,38 @@
 ---
+- name: Gather hardware facts for PostgreSQL parameter sizing
+  ansible.builtin.setup:
+    gather_subset:
+      - hardware
+  when: ansible_memtotal_mb is not defined
+
+# No built-in PostgreSQL equivalent of MySQL's innodb_dedicated_server, so
+# these are derived from detected RAM using standard pgtune/EDB heuristics:
+# shared_buffers 25% of RAM (≈128MB at 512MB RAM, matching PostgreSQL's own
+# built-in default — no regression on the smallest CloudStack plan),
+# effective_cache_size 75% (planner hint, not an allocation), maintenance_work_mem
+# 10% capped at 1GB, work_mem (RAM - shared_buffers) / (16 * vCPUs) floored at
+# PostgreSQL's own 4MB default and capped at 256MB as a safety valve.
+- name: Compute PostgreSQL memory parameters from detected node resources
+  ansible.builtin.set_fact:
+    erawan_pg_shared_buffers_mb: "{{ ((ansible_memtotal_mb | default(512) | int) * postgres_shared_buffers_percent // 100) }}"
+    erawan_pg_effective_cache_size_mb: "{{ ((ansible_memtotal_mb | default(512) | int) * postgres_effective_cache_size_percent // 100) }}"
+    erawan_pg_maintenance_work_mem_mb: >-
+      {{ [((ansible_memtotal_mb | default(512) | int) * postgres_maintenance_work_mem_percent // 100), postgres_maintenance_work_mem_ceiling_mb | int] | min }}
+  when: erawan_pg_shared_buffers_mb is not defined
+
+- name: Compute PostgreSQL work_mem from detected node resources
+  ansible.builtin.set_fact:
+    erawan_pg_work_mem_mb: >-
+      {{ [
+           [
+             (((ansible_memtotal_mb | default(512) | int) - (erawan_pg_shared_buffers_mb | int))
+               // (postgres_work_mem_cpu_divisor * (ansible_processor_vcpus | default(1) | int))),
+             postgres_work_mem_floor_mb | int
+           ] | max,
+           postgres_work_mem_ceiling_mb | int
+         ] | min }}
+  when: erawan_pg_work_mem_mb is not defined
+
 - name: Detect installed PostgreSQL major version
   ansible.builtin.shell: |
     set -euo pipefail

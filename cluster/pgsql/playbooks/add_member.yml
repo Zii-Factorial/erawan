@@ -22,7 +22,23 @@
     - preflight
 
 # ---------------------------------------------------------------------------
-# PLAY 3 — Install, configure, and start etcd + Patroni on the new node
+# PLAY 3 — Refresh etcd/Patroni/PostgreSQL firewall rules on existing nodes so
+#           they allow the new member's IP. Must run before Play 4: the new
+#           node's etcd/Patroni connect OUT to the existing primary to join,
+#           and the primary's rule (set at its own deploy time) doesn't know
+#           about the new member yet — without this it's dropped once UFW is
+#           actually enforcing.
+# ---------------------------------------------------------------------------
+- name: Refresh PostgreSQL cluster firewall on existing nodes
+  hosts: pgsql_primary:pgsql_standby
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - pgsql_peer_firewall
+
+# ---------------------------------------------------------------------------
+# PLAY 4 — Install, configure, and start etcd + Patroni on the new node
 #           Uses base_config and configure_node with etcd "existing" state.
 # ---------------------------------------------------------------------------
 - name: Set up new PostgreSQL standby
@@ -39,7 +55,7 @@
     - add_member_join
 
 # ---------------------------------------------------------------------------
-# PLAY 4 — Verify cluster health on all nodes
+# PLAY 5 — Verify cluster health on all nodes
 # ---------------------------------------------------------------------------
 - name: Verify cluster after member addition
   hosts: all

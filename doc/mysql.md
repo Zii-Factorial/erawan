@@ -152,6 +152,7 @@ bind-address = 0.0.0.0
 report_host = 10.0.0.1
 max_connections = 500
 mysqlx = OFF
+innodb_dedicated_server = ON
 loose-group_replication_start_on_boot = OFF
 loose-group_replication_autorejoin_tries = 10
 loose-group_replication_member_expel_timeout = 5
@@ -178,6 +179,8 @@ ssl_key = /var/lib/mysql/server-key.pem
 > `loose-group_replication_start_on_boot = OFF` in this file is intentional for fresh deploys. The `auto_rejoin` role writes `SET PERSIST group_replication_start_on_boot = ON` to `/var/lib/mysql/mysqld-auto.cnf` which takes precedence at runtime.
 
 > `group_replication_message_cache_size` (`mysql_gr_message_cache_size` var, default `134217728` = 128MB) is set to the MySQL-enforced minimum (MySQL >= 8.0.21; below that the floor is 1GB) to fit the smallest CloudStack plan (512MB RAM). The cache structures need ~50MB beyond the configured value, so budget ~180MB for GR alone on a 512MB node. Raise this var for larger plans if XCom cache eviction becomes an issue under heavy write load.
+
+> `innodb_dedicated_server = ON` lets MySQL auto-size `innodb_buffer_pool_size` (and redo log capacity) from the node's detected RAM/CPU instead of leaving it at the fixed 128MB engine default regardless of plan size. Sizing tiers (from [MySQL's own docs](https://dev.mysql.com/doc/refman/8.0/en/innodb-dedicated-server.html)): < 1GB detected memory → 128MB (unchanged from today), 1GB-4GB → 50% of memory, > 4GB → 75% of memory. Only recommended when MySQL owns the whole VM, which is always true here — every node is a single-purpose CloudStack VM for one cluster member.
 
 Verify: `sudo cat /etc/mysql/mysql.conf.d/99-erawan-cluster.cnf`
 

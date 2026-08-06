@@ -5,6 +5,11 @@ report_host = {{ erawan_node_ip }}
 max_connections = {{ mysql_max_connections | int }}
 {% endif %}
 mysqlx = OFF
+# Every node here is a single-purpose CloudStack VM running only MySQL, so
+# this auto-sizes innodb_buffer_pool_size (and redo log capacity) from
+# detected RAM/CPU instead of the tiny 128MB engine default. Safe by design:
+# below 1GB detected memory MySQL keeps the same 128MB it uses today.
+innodb_dedicated_server = ON
 loose-group_replication_start_on_boot = OFF
 loose-group_replication_autorejoin_tries = {{ mysql_gr_autorejoin_tries }}
 loose-group_replication_member_expel_timeout = {{ mysql_gr_member_expel_timeout }}

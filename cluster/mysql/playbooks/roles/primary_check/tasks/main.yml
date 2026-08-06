@@ -21,11 +21,12 @@
   failed_when: false
   tags: ["primary_check"]
 
-- name: Allow primary-check port through UFW
+- name: Allow primary-check port from proxy only
   community.general.ufw:
     rule: allow
     port: "{{ primary_check_port | string }}"
     proto: tcp
+    src: "{{ proxy_allowed_ip }}"
     comment: MySQL primary-check for HAProxy
   when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
   tags: ["primary_check"]

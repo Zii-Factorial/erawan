@@ -29,6 +29,10 @@ bootstrap:
 {% if (postgres_max_connections | default(0) | int) >= 25 %}
         max_connections: {{ postgres_max_connections | int }}
 {% endif %}
+        shared_buffers: '{{ erawan_pg_shared_buffers_mb }}MB'
+        effective_cache_size: '{{ erawan_pg_effective_cache_size_mb }}MB'
+        maintenance_work_mem: '{{ erawan_pg_maintenance_work_mem_mb }}MB'
+        work_mem: '{{ erawan_pg_work_mem_mb }}MB'
         wal_level: replica
         hot_standby: "on"
         max_wal_senders: 10
@@ -53,15 +57,24 @@ bootstrap:
     - local replication all peer
 {% if (new_user | default('')) | length > 0 %}
 {% if new_user_ssl_required | default(true) | bool %}
-    - hostssl all {{ new_user }} 0.0.0.0/0 scram-sha-256
-    - hostnossl all {{ new_user }} 0.0.0.0/0 reject
+    - hostssl all {{ new_user }} {{ proxy_allowed_ip }}/32 scram-sha-256
+    - hostnossl all {{ new_user }} {{ proxy_allowed_ip }}/32 reject
 {% else %}
-    - host all {{ new_user }} 0.0.0.0/0 scram-sha-256
+    - host all {{ new_user }} {{ proxy_allowed_ip }}/32 scram-sha-256
 {% endif %}
 {% endif %}
-    - host replication {{ replication_user }} 0.0.0.0/0 scram-sha-256
-    - host all all 0.0.0.0/0 scram-sha-256
-    - host all all ::/0 scram-sha-256
+{# replication is a distinct pseudo-database in pg_hba — a "database: all"
+   entry below does not implicitly match it, so it needs its own peer-scoped
+   entries. Streaming replication is always node-to-node, never via the proxy. #}
+{% for host_name in groups['all'] %}
+    - host replication {{ replication_user }} {{ hostvars[host_name].ansible_host }}/32 scram-sha-256
+{% endfor %}
+{# Catch-all for postgres_superuser/patroni_admin/generic access — scoped to
+   cluster peers only (Patroni/etcd coordination, self-connections), never the
+   whole internet. No IPv6 rule: nothing in this deployment uses IPv6. #}
+{% for host_name in groups['all'] %}
+    - host all all {{ hostvars[host_name].ansible_host }}/32 scram-sha-256
+{% endfor %}
   users:
     {{ patroni_admin_user }}:
       password: {{ patroni_admin_password | to_json }}
