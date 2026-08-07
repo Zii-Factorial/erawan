@@ -75,28 +75,20 @@
     # own loopback heartbeat, the proxy app user, and every existing peer.
     # Seed the baseline from the primary's live pg_hba.conf instead (same
     # approach as the Go dbmanager's patchPatroniPgHba).
-    # -p/-h are explicit because Debian's psql wrapper otherwise resolves the
-    # port from the disarmed OS-packaged cluster's config (observed: tried
-    # socket .s.PGSQL.5433 while Patroni's postgres listens on postgres_port).
-    - name: Locate the primary's live pg_hba.conf
-      ansible.builtin.command:
-        argv:
-          - psql
-          - -p
-          - "{{ postgres_port | string }}"
-          - -h
-          - /var/run/postgresql
-          - -tAc
-          - "SHOW hba_file;"
-      become_user: postgres
-      register: _hba_file_path
-      changed_when: false
-      run_once: true
-      when: (_current_patroni_config.json.postgresql.pg_hba | default([])) | length == 0
+    # Derives erawan_pg_data_directory for the slurp below; every task in the
+    # role is guarded by "is not defined", so this is a no-op if another play
+    # already ran it on this host.
+    - name: Discover PostgreSQL runtime facts on the primary
+      ansible.builtin.import_role:
+        name: runtime_facts
 
+    # Patroni manages pg_hba.conf inside the data directory, so root reads it
+    # straight off disk — a psql "SHOW hba_file" round-trip proved fragile
+    # here (Debian's wrapper resolved the wrong port; become_user ran as root
+    # under pipelining).
     - name: Read the primary's live pg_hba.conf
       ansible.builtin.slurp:
-        src: "{{ _hba_file_path.stdout | trim }}"
+        src: "{{ erawan_pg_data_directory }}/pg_hba.conf"
       register: _hba_file
       no_log: true
       run_once: true

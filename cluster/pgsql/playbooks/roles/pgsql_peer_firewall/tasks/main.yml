@@ -18,6 +18,26 @@
   failed_when: false
   tags: ["base_config", "pgsql_peer_firewall"]
 
+# Deploys made before source-scoping existed added any-source rules for these
+# same ports. UFW rules are additive — the scoped rules below do not shadow
+# them, so the old rules would keep admitting the whole world. Delete them
+# first; harmless no-op when absent.
+- name: Remove legacy unscoped allow rules
+  community.general.ufw:
+    rule: allow
+    port: "{{ item | string }}"
+    proto: tcp
+    delete: true
+  loop:
+    - "{{ etcd_client_port }}"
+    - "{{ etcd_peer_port }}"
+    - "{{ patroni_rest_port }}"
+    - "{{ postgres_port }}"
+    - "{{ postgres_exporter_port }}"
+  when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
+  failed_when: false
+  tags: ["base_config", "pgsql_peer_firewall"]
+
 - name: Allow etcd ports from cluster peers only
   community.general.ufw:
     rule: allow
@@ -37,5 +57,22 @@
     src: "{{ item.1 }}"
     comment: Patroni/PostgreSQL client (via proxy) and inter-node traffic
   loop: "{{ [patroni_rest_port, postgres_port] | product(([proxy_allowed_ip] + [primary_ip] + standby_ips) | unique) | list }}"
+  when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
+  tags: ["base_config", "pgsql_peer_firewall"]
+
+# Lives here (not base_config) so every call site — deploy, add_member's
+# peer refresh, and start/recover via cluster_bootstrap — applies it: a
+# scale-recreated node that only ever runs start/recover would otherwise
+# come up with no exporter rule and be unreachable for metrics collection.
+- name: Allow exporter ports from control plane only
+  community.general.ufw:
+    rule: allow
+    port: "{{ item | string }}"
+    proto: tcp
+    src: "{{ proxy_allowed_ip }}"
+    comment: exporter scraped by erawan control plane
+  loop:
+    - "{{ postgres_exporter_port }}"
+    - "{{ node_exporter_port }}"
   when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
   tags: ["base_config", "pgsql_peer_firewall"]

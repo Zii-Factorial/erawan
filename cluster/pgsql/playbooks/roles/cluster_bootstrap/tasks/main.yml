@@ -393,30 +393,13 @@
   when: inventory_hostname in groups['pgsql_primary']
   tags: ["cluster_bootstrap"]
 
-# -p/-h are explicit because Debian's psql wrapper otherwise resolves the
-# port from the disarmed OS-packaged cluster's config (observed: tried
-# socket .s.PGSQL.5433 while Patroni's postgres listens on postgres_port).
-- name: Locate the primary's live pg_hba.conf
-  ansible.builtin.command:
-    argv:
-      - psql
-      - -p
-      - "{{ postgres_port | string }}"
-      - -h
-      - /var/run/postgresql
-      - -tAc
-      - "SHOW hba_file;"
-  become_user: postgres
-  register: _bootstrap_hba_file_path
-  changed_when: false
-  when:
-    - inventory_hostname in groups['pgsql_primary']
-    - (_bootstrap_patroni_config.json.postgresql.pg_hba | default([])) | length == 0
-  tags: ["cluster_bootstrap"]
-
+# Patroni manages pg_hba.conf inside the data directory, so root reads it
+# straight off disk — a psql "SHOW hba_file" round-trip proved fragile here
+# (Debian's wrapper resolved the wrong port; become_user ran as root under
+# pipelining) and the file location is already known from runtime_facts.
 - name: Read the primary's live pg_hba.conf
   ansible.builtin.slurp:
-    src: "{{ _bootstrap_hba_file_path.stdout | trim }}"
+    src: "{{ erawan_pg_data_directory }}/pg_hba.conf"
   register: _bootstrap_hba_file
   no_log: true
   when:
@@ -424,15 +407,32 @@
     - (_bootstrap_patroni_config.json.postgresql.pg_hba | default([])) | length == 0
   tags: ["cluster_bootstrap"]
 
-- name: Resolve pg_hba baseline and members missing from it
+- name: Resolve pg_hba baseline and entries missing from it
   ansible.builtin.set_fact:
     _bootstrap_pg_hba_base: "{{ _hba_base }}"
     _bootstrap_pg_hba_missing_ips: >-
       {{ (([primary_ip] + (standby_ips | default([]))) | unique)
          | map('regex_replace', '^(.*)$', '\g<1>/32')
-         | reject('in', _hba_base | join('\n'))
+         | reject('in', _joined)
          | map('regex_replace', '/32$', '')
          | list }}
+    # Heals clusters whose live pg_hba predates the loopback/app-user
+    # template entries (or lost them): Patroni's own heartbeat needs
+    # loopback, the app user connects only via the proxy.
+    _bootstrap_pg_hba_extra: >-
+      {{
+        (['host all all 127.0.0.1/32 scram-sha-256'] if '127.0.0.1/32' not in _joined else [])
+        + (['host all all ::1/128 scram-sha-256'] if '::1/128' not in _joined else [])
+        + ((
+            ['hostssl all ' ~ new_user ~ ' ' ~ proxy_allowed_ip ~ '/32 scram-sha-256',
+             'hostnossl all ' ~ new_user ~ ' ' ~ proxy_allowed_ip ~ '/32 reject']
+            if (new_user_ssl_required | default(true) | bool)
+            else ['host all ' ~ new_user ~ ' ' ~ proxy_allowed_ip ~ '/32 scram-sha-256']
+          )
+          if (((new_user | default('')) | length > 0)
+              and ((new_user ~ ' ' ~ proxy_allowed_ip ~ '/32') not in _joined))
+          else [])
+      }}
   vars:
     _hba_base: >-
       {{
@@ -445,6 +445,7 @@
           | list
         )
       }}
+    _joined: "{{ _hba_base | join('\n') }}"
   no_log: true
   when: inventory_hostname in groups['pgsql_primary']
   tags: ["cluster_bootstrap"]
@@ -459,6 +460,7 @@
         pg_hba: >-
           {{
             _bootstrap_pg_hba_base
+            + _bootstrap_pg_hba_extra
             + (_bootstrap_pg_hba_missing_ips
                | map('regex_replace', '^(.*)$',
                      'host replication ' ~ replication_user ~ ' \g<1>/32 scram-sha-256')
@@ -471,7 +473,7 @@
   no_log: true
   when:
     - inventory_hostname in groups['pgsql_primary']
-    - _bootstrap_pg_hba_missing_ips | length > 0
+    - (_bootstrap_pg_hba_missing_ips | length > 0) or (_bootstrap_pg_hba_extra | length > 0)
   tags: ["cluster_bootstrap"]
 
 - name: Start Patroni on standby nodes
