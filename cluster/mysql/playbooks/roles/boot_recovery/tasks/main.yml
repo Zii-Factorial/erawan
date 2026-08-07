@@ -92,6 +92,19 @@
     state: started
   tags: ["boot_recovery"]
 
+# Start/recover doesn't run configure_instances/auto_rejoin — deploy/add-member
+# only roles — so a node whose VM was recreated by a scale operation (fresh
+# disk, none of that ever ran) is missing erawan-gr-watchdog.service/.timer
+# entirely. The "Pause"/"Resume" tasks below already tolerate that (best-effort
+# failed_when/ignore_errors), which is why this doesn't fail the job — but
+# silently leaves the node with no self-healing watchdog afterward. Reinstall
+# here, before pausing it: idempotent (safe to reapply on a node that already
+# has it), and requires the live mysqld connection just started above.
+- name: Reinstall GR auto-rejoin watchdog (self-healing after a scale-recreated disk)
+  ansible.builtin.import_role:
+    name: auto_rejoin
+  tags: ["boot_recovery"]
+
 # Enabled only — the staggered per-node systemd race (30/60/90s delays) is
 # for unattended host reboots. Starting the unit on every node here made all
 # three race each other: secondaries hit benign rejoin errors and failed the
