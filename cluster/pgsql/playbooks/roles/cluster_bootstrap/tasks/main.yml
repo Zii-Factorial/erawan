@@ -41,6 +41,20 @@
     name: runtime_facts
   tags: ["cluster_bootstrap"]
 
+# Start/recover often follows a scale operation that recreated node VMs —
+# possibly with different IPs. The initial-cluster refresh below already
+# reconciles etcd's CONFIG to current membership every run, but nothing
+# reconciled the FIREWALL: peer-scoped UFW rules written at deploy/add-member
+# time still list the old IPs, so a recreated peer's etcd (2380) traffic is
+# dropped and the cluster sits at "RAFT NO LEADER" forever. Re-applying the
+# shared peer-firewall role here (idempotent, no-op when UFW is inactive or
+# rules already match) makes start/recover self-healing on this dimension,
+# and must run BEFORE etcd starts so peer traffic is allowed when it does.
+- name: Refresh peer firewall rules to current cluster membership
+  ansible.builtin.import_role:
+    name: pgsql_peer_firewall
+  tags: ["cluster_bootstrap"]
+
 # /var/run/postgresql lives on tmpfs, so a host reboot wipes it. base_config
 # creates it at deploy time, but start/recover only runs this role — without
 # it Postgres dies instantly at every Patroni start attempt (cannot create
@@ -359,6 +373,95 @@
                    if (postgres_max_connections | default(0) | int) > 0 else {}) }}
     status_code: [200]
   when: inventory_hostname in groups['pgsql_primary']
+  tags: ["cluster_bootstrap"]
+
+# pg_hba entries are pinned to member IPs since the proxy-IP restriction, and
+# a scale-recreated node can come back with a DIFFERENT IP — the DCS pg_hba
+# (or the bootstrap-time pg_hba.conf) then lacks it and that node's streaming
+# replication is rejected forever. Reconcile here so start/recover heals it,
+# mirroring add_member's refresh play. bootstrap.pg_hba never lands in the
+# DCS, so when /config has no pg_hba the baseline is seeded from the
+# primary's live pg_hba.conf — never from an empty default, which would
+# REPLACE the effective pg_hba everywhere with only the appended lines.
+- name: Get current Patroni DCS config for pg_hba reconciliation
+  ansible.builtin.uri:
+    url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/config"
+    return_content: true
+    status_code: 200
+  register: _bootstrap_patroni_config
+  no_log: true
+  when: inventory_hostname in groups['pgsql_primary']
+  tags: ["cluster_bootstrap"]
+
+- name: Locate the primary's live pg_hba.conf
+  ansible.builtin.command:
+    argv: [psql, -tAc, "SHOW hba_file;"]
+  become_user: postgres
+  register: _bootstrap_hba_file_path
+  changed_when: false
+  when:
+    - inventory_hostname in groups['pgsql_primary']
+    - (_bootstrap_patroni_config.json.postgresql.pg_hba | default([])) | length == 0
+  tags: ["cluster_bootstrap"]
+
+- name: Read the primary's live pg_hba.conf
+  ansible.builtin.slurp:
+    src: "{{ _bootstrap_hba_file_path.stdout | trim }}"
+  register: _bootstrap_hba_file
+  no_log: true
+  when:
+    - inventory_hostname in groups['pgsql_primary']
+    - (_bootstrap_patroni_config.json.postgresql.pg_hba | default([])) | length == 0
+  tags: ["cluster_bootstrap"]
+
+- name: Resolve pg_hba baseline and members missing from it
+  ansible.builtin.set_fact:
+    _bootstrap_pg_hba_base: "{{ _hba_base }}"
+    _bootstrap_pg_hba_missing_ips: >-
+      {{ (([primary_ip] + (standby_ips | default([]))) | unique)
+         | map('regex_replace', '^(.*)$', '\g<1>/32')
+         | reject('in', _hba_base | join('\n'))
+         | map('regex_replace', '/32$', '')
+         | list }}
+  vars:
+    _hba_base: >-
+      {{
+        (_bootstrap_patroni_config.json.postgresql.pg_hba | default([]))
+        if ((_bootstrap_patroni_config.json.postgresql.pg_hba | default([])) | length > 0)
+        else (
+          (_bootstrap_hba_file.content | b64decode).splitlines()
+          | map('trim')
+          | select('match', '^(local|host)')
+          | list
+        )
+      }}
+  no_log: true
+  when: inventory_hostname in groups['pgsql_primary']
+  tags: ["cluster_bootstrap"]
+
+- name: Reconcile pg_hba with current cluster members
+  ansible.builtin.uri:
+    url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/config"
+    method: PATCH
+    body_format: json
+    body:
+      postgresql:
+        pg_hba: >-
+          {{
+            _bootstrap_pg_hba_base
+            + (_bootstrap_pg_hba_missing_ips
+               | map('regex_replace', '^(.*)$',
+                     'host replication ' ~ replication_user ~ ' \g<1>/32 scram-sha-256')
+               | list)
+            + (_bootstrap_pg_hba_missing_ips
+               | map('regex_replace', '^(.*)$', 'host all all \g<1>/32 scram-sha-256')
+               | list)
+          }}
+    status_code: [200]
+  no_log: true
+  when:
+    - inventory_hostname in groups['pgsql_primary']
+    - _bootstrap_pg_hba_missing_ips | length > 0
   tags: ["cluster_bootstrap"]
 
 - name: Start Patroni on standby nodes

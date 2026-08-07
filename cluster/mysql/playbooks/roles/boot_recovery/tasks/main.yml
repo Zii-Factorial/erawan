@@ -36,6 +36,18 @@
           test never succeeded — check that python3 is installed on the node.
           {%- endif %}
 
+# Start/recover often follows a scale operation that recreated node VMs —
+# possibly with different IPs. Peer-scoped UFW rules written at
+# deploy/add-member time still list the old IPs on the surviving nodes, so
+# GR traffic between peers (and client traffic from the proxy) is dropped.
+# Re-applying the shared firewall role here (idempotent, no-op when UFW is
+# inactive) makes start/recover self-healing on this dimension, before any
+# reboot/rejoin below needs peer connectivity.
+- name: Refresh MySQL firewall rules to current cluster membership
+  ansible.builtin.import_role:
+    name: mysql_port_firewall
+  tags: ["boot_recovery"]
+
 - name: Ensure erawan config directory exists
   ansible.builtin.file:
     path: /etc/erawan-cluster
