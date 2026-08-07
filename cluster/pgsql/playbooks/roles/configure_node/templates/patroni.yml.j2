@@ -84,11 +84,16 @@ bootstrap:
     - host replication {{ replication_user }} {{ hostvars[host_name].ansible_host }}/32 scram-sha-256
 {% endfor %}
 {# Catch-all for postgres_superuser/patroni_admin/generic access — scoped to
-   cluster peers only (Patroni/etcd coordination, self-connections), never the
-   whole internet. No IPv6 rule: nothing in this deployment uses IPv6. #}
+   cluster peers plus the proxy/control-plane node, never the whole internet.
+   The proxy IP is included because the erawan control plane (same machine as
+   the proxy) manages users/databases over postgres-superuser connections —
+   the app-user entries above don't cover those. The app user's stricter
+   hostnossl-reject pair still wins for that user: pg_hba is first-match.
+   No IPv6 rule: nothing in this deployment uses IPv6. #}
 {% for host_name in groups['all'] %}
     - host all all {{ hostvars[host_name].ansible_host }}/32 scram-sha-256
 {% endfor %}
+    - host all all {{ proxy_allowed_ip }}/32 scram-sha-256
   users:
     {{ patroni_admin_user }}:
       password: {{ patroni_admin_password | to_json }}
