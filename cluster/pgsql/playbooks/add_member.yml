@@ -75,9 +75,19 @@
     # own loopback heartbeat, the proxy app user, and every existing peer.
     # Seed the baseline from the primary's live pg_hba.conf instead (same
     # approach as the Go dbmanager's patchPatroniPgHba).
+    # -p/-h are explicit because Debian's psql wrapper otherwise resolves the
+    # port from the disarmed OS-packaged cluster's config (observed: tried
+    # socket .s.PGSQL.5433 while Patroni's postgres listens on postgres_port).
     - name: Locate the primary's live pg_hba.conf
       ansible.builtin.command:
-        argv: [psql, -tAc, "SHOW hba_file;"]
+        argv:
+          - psql
+          - -p
+          - "{{ postgres_port | string }}"
+          - -h
+          - /var/run/postgresql
+          - -tAc
+          - "SHOW hba_file;"
       become_user: postgres
       register: _hba_file_path
       changed_when: false
