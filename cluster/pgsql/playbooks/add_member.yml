@@ -67,6 +67,47 @@
       no_log: true
       run_once: true
 
+    # bootstrap.pg_hba is written into pg_hba.conf at initdb time but is NOT
+    # stored in the DCS — a freshly bootstrapped cluster has no
+    # postgresql.pg_hba in /config at all. PATCHing "existing + new lines"
+    # against an empty default would therefore REPLACE the effective pg_hba
+    # on every node with just the two new-member lines, locking out Patroni's
+    # own loopback heartbeat, the proxy app user, and every existing peer.
+    # Seed the baseline from the primary's live pg_hba.conf instead (same
+    # approach as the Go dbmanager's patchPatroniPgHba).
+    - name: Locate the primary's live pg_hba.conf
+      ansible.builtin.command:
+        argv: [psql, -tAc, "SHOW hba_file;"]
+      become_user: postgres
+      register: _hba_file_path
+      changed_when: false
+      run_once: true
+      when: (_current_patroni_config.json.postgresql.pg_hba | default([])) | length == 0
+
+    - name: Read the primary's live pg_hba.conf
+      ansible.builtin.slurp:
+        src: "{{ _hba_file_path.stdout | trim }}"
+      register: _hba_file
+      no_log: true
+      run_once: true
+      when: (_current_patroni_config.json.postgresql.pg_hba | default([])) | length == 0
+
+    - name: Resolve the pg_hba baseline
+      ansible.builtin.set_fact:
+        _pg_hba_base: >-
+          {{
+            (_current_patroni_config.json.postgresql.pg_hba | default([]))
+            if ((_current_patroni_config.json.postgresql.pg_hba | default([])) | length > 0)
+            else (
+              (_hba_file.content | b64decode).splitlines()
+              | map('trim')
+              | select('match', '^(local|host)')
+              | list
+            )
+          }}
+      no_log: true
+      run_once: true
+
     - name: Refresh pg_hba to include the new member
       ansible.builtin.uri:
         url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/config"
@@ -79,7 +120,7 @@
           postgresql:
             pg_hba: >-
               {{
-                (_current_patroni_config.json.postgresql.pg_hba | default([]))
+                _pg_hba_base
                 + [
                     'host replication ' ~ replication_user ~ ' ' ~ new_member_ip ~ '/32 scram-sha-256',
                     'host all all ' ~ new_member_ip ~ '/32 scram-sha-256'
@@ -88,9 +129,7 @@
         status_code: 200
       no_log: true
       run_once: true
-      when: >-
-        (new_member_ip ~ '/32') not in
-        ((_current_patroni_config.json.postgresql.pg_hba | default([])) | join('\n'))
+      when: (new_member_ip ~ '/32') not in (_pg_hba_base | join('\n'))
 
 # ---------------------------------------------------------------------------
 # PLAY 5 — Install, configure, and start etcd + Patroni on the new node
