@@ -36,6 +36,18 @@
           test never succeeded — check that python3 is installed on the node.
           {%- endif %}
 
+# Start/recover often follows a scale operation that recreated node VMs —
+# possibly with different IPs. Peer-scoped UFW rules written at
+# deploy/add-member time still list the old IPs on the surviving nodes, so
+# GR traffic between peers (and client traffic from the proxy) is dropped.
+# Re-applying the shared firewall role here (idempotent, no-op when UFW is
+# inactive) makes start/recover self-healing on this dimension, before any
+# reboot/rejoin below needs peer connectivity.
+- name: Refresh MySQL firewall rules to current cluster membership
+  ansible.builtin.import_role:
+    name: mysql_port_firewall
+  tags: ["boot_recovery"]
+
 - name: Ensure erawan config directory exists
   ansible.builtin.file:
     path: /etc/erawan-cluster
@@ -78,6 +90,19 @@
   ansible.builtin.systemd:
     name: mysql
     state: started
+  tags: ["boot_recovery"]
+
+# Start/recover doesn't run configure_instances/auto_rejoin — deploy/add-member
+# only roles — so a node whose VM was recreated by a scale operation (fresh
+# disk, none of that ever ran) is missing erawan-gr-watchdog.service/.timer
+# entirely. The "Pause"/"Resume" tasks below already tolerate that (best-effort
+# failed_when/ignore_errors), which is why this doesn't fail the job — but
+# silently leaves the node with no self-healing watchdog afterward. Reinstall
+# here, before pausing it: idempotent (safe to reapply on a node that already
+# has it), and requires the live mysqld connection just started above.
+- name: Reinstall GR auto-rejoin watchdog (self-healing after a scale-recreated disk)
+  ansible.builtin.import_role:
+    name: auto_rejoin
   tags: ["boot_recovery"]
 
 # Enabled only — the staggered per-node systemd race (30/60/90s delays) is

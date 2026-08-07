@@ -22,7 +22,70 @@
     - remove_member
 
 # ---------------------------------------------------------------------------
-# PLAY 3 — Verify cluster health on remaining nodes
+# PLAY 3 — Revoke the removed member's access on the remaining nodes. Without
+#           this the removed IP keeps full peer-level access (UFW + pg_hba)
+#           forever — and CloudStack reuses IPs, so a later unrelated VM
+#           could inherit it.
+# ---------------------------------------------------------------------------
+- name: Revoke removed member access on remaining nodes
+  hosts: pgsql_primary:pgsql_standby
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Check UFW availability and status
+      ansible.builtin.command:
+        argv: [ufw, status]
+      register: _ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Remove UFW rules scoped to the removed member
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.0 | string }}"
+        proto: tcp
+        src: "{{ item.1 }}"
+        delete: true
+      loop: "{{ [etcd_client_port, etcd_peer_port, patroni_rest_port, postgres_port] | product([remove_member_ip]) | list }}"
+      when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
+      failed_when: false
+
+    - name: Get current Patroni DCS config
+      ansible.builtin.uri:
+        url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/config"
+        return_content: true
+        status_code: 200
+      register: _remove_patroni_config
+      no_log: true
+      run_once: true
+      delegate_to: "{{ groups['pgsql_primary'][0] }}"
+
+    # Only strips when the DCS already owns pg_hba (same rule as the Go
+    # dbmanager: never take ownership of pg_hba on a delete path). A cluster
+    # still running purely on its bootstrap-time pg_hba.conf gets cleaned up
+    # by the next start/recover reconcile instead.
+    - name: Strip removed member from pg_hba
+      ansible.builtin.uri:
+        url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/config"
+        method: PATCH
+        body_format: json
+        body:
+          postgresql:
+            pg_hba: >-
+              {{ _remove_patroni_config.json.postgresql.pg_hba
+                 | reject('search', (remove_member_ip | regex_escape) ~ '/32')
+                 | list }}
+        status_code: [200]
+      no_log: true
+      run_once: true
+      delegate_to: "{{ groups['pgsql_primary'][0] }}"
+      when:
+        - (_remove_patroni_config.json.postgresql.pg_hba | default([])) | length > 0
+        - (remove_member_ip ~ '/32') in (_remove_patroni_config.json.postgresql.pg_hba | join('\n'))
+
+# ---------------------------------------------------------------------------
+# PLAY 4 — Verify cluster health on remaining nodes
 # ---------------------------------------------------------------------------
 - name: Verify cluster after member removal
   hosts: pgsql_primary:pgsql_standby

@@ -31,21 +31,9 @@
     erawan_server_id: "{{ (groups['all'] | list).index(inventory_hostname) + 1 }}"
   tags: ["configure_instances", "configure_mysql"]
 
-- name: Check UFW availability and status
-  ansible.builtin.command:
-    argv: [ufw, status]
-  register: _ufw_status
-  changed_when: false
-  failed_when: false
-  tags: ["configure_instances", "configure_mysql"]
-
-- name: Allow MySQL port through UFW for cluster communication
-  community.general.ufw:
-    rule: allow
-    port: "{{ mysql_port | string }}"
-    proto: tcp
-    comment: MySQL InnoDB Cluster
-  when: "_ufw_status.rc == 0 and 'Status: active' in _ufw_status.stdout"
+- name: Apply MySQL port firewall rules
+  ansible.builtin.import_role:
+    name: mysql_port_firewall
   tags: ["configure_instances", "configure_mysql"]
 
 - name: Ensure minimal MySQL config for InnoDB Cluster

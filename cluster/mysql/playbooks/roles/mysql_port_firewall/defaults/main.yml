@@ -1,0 +1,6 @@
+---
+# mysqld_exporter and node_exporter ship pre-baked in the VM image (not
+# provisioned by this repo), scraped directly by the erawan control plane —
+# proxy_allowed_ip only.
+mysqld_exporter_port: 9104
+node_exporter_port: 9100

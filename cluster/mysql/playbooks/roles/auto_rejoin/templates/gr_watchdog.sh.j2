@@ -30,6 +30,7 @@ trap 'rm -f "$_tmp"' EXIT
 _tmp=$(mktemp /tmp/erawan-watchdog-XXXXXX.py)
 cat > "$_tmp" <<'PY'
 import json
+import time
 
 shell.options["useWizards"] = False
 
@@ -60,6 +61,16 @@ for stmt in ("STOP GROUP_REPLICATION",
     except Exception:
         pass
 
+def connect_node(ip):
+    shell.connect({
+        "user":     cfg["admin_user"],
+        "password": cfg["admin_pass"],
+        "host":     ip,
+        "port":     cfg["mysql_port"],
+        "scheme":   "mysql",
+    })
+    return shell.get_session()
+
 # Use cluster.rejoinInstance() instead of raw START GROUP_REPLICATION — it
 # re-validates GTIDs and cluster metadata before joining, which makes it
 # reliable even when the local GR channel state is dirty after a crash.
@@ -68,13 +79,7 @@ for seed_ip in cfg.get("node_ips", []):
     if seed_ip == this_ip:
         continue
     try:
-        shell.connect({
-            "user":     cfg["admin_user"],
-            "password": cfg["admin_pass"],
-            "host":     seed_ip,
-            "port":     cfg["mysql_port"],
-            "scheme":   "mysql",
-        })
+        connect_node(seed_ip)
         cluster = dba.get_cluster(cfg["cluster_name"])
         cluster.rejoin_instance(
             f"{cfg['admin_user']}@{this_ip}:{cfg['mysql_port']}",
@@ -90,6 +95,75 @@ for seed_ip in cfg.get("node_ips", []):
             rejoined = True
             break
         print(f"seed {seed_ip}: {e}")
+
+def cluster_is_alive():
+    """True when any configured node (including this one) currently reports
+    an ONLINE GR member — i.e. a live group exists somewhere. Only safe to
+    reboot-from-outage when this is False; forcing a reboot while a live
+    group exists elsewhere risks splitting it."""
+    for ip in cfg.get("node_ips", []):
+        try:
+            s = connect_node(ip)
+            online = s.run_sql(
+                "SELECT COUNT(*) FROM performance_schema.replication_group_members "
+                "WHERE member_state = 'ONLINE'").fetch_one()[0]
+            if int(online) > 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+def reboot_with_retry(options):
+    """reboot_cluster_from_complete_outage, retrying while a START/STOP
+    GROUP_REPLICATION is already in flight elsewhere (MySQL error 3663)."""
+    deadline = time.time() + 90
+    while True:
+        connect_node("127.0.0.1")
+        try:
+            if options is None:
+                dba.reboot_cluster_from_complete_outage(cfg["cluster_name"])
+            else:
+                dba.reboot_cluster_from_complete_outage(cfg["cluster_name"], options)
+            return
+        except Exception as e:
+            if "3663" in str(e) and time.time() < deadline:
+                time.sleep(5)
+                continue
+            raise
+
+if not rejoined and not cluster_is_alive():
+    # rejoin_instance only helps when a live peer already has the group
+    # running. A single-node ("standalone") cluster has no peer to rejoin
+    # via — node_ips contains only this node's own IP, so the loop above is
+    # always a no-op — and plain START GROUP_REPLICATION can't restart an
+    # outaged group from nothing; it needs group_replication_bootstrap_group
+    # = ON, which is what reboot_cluster_from_complete_outage does under the
+    # hood. This mirrors the boot_recovery role's own recovery path, so a
+    # standalone node's GR failure self-heals here too, not just after a
+    # full VM reboot (also covers a genuine complete outage of an N-node
+    # cluster that never restarted mysqld).
+    print("no ONLINE member anywhere — attempting reboot_cluster_from_complete_outage")
+    try:
+        reboot_with_retry(None)
+        print("rebooted cluster from complete outage (quorum-safe)")
+        rejoined = True
+    except Exception as first_err:
+        first_msg = str(first_err).lower()
+        if any(t in first_msg for t in ("already active", "online", "is running", "cluster is active")):
+            print("cluster already active — a peer recovered first")
+            rejoined = True
+        else:
+            try:
+                reboot_with_retry({"force": True})
+                print("rebooted cluster from complete outage (forced)")
+                rejoined = True
+            except Exception as force_err:
+                force_msg = str(force_err).lower()
+                if any(t in force_msg for t in ("already active", "online", "is running", "cluster is active")):
+                    print("cluster already active — a peer recovered first")
+                    rejoined = True
+                else:
+                    print(f"reboot_cluster_from_complete_outage failed: {force_err}")
 
 if not rejoined:
     # Last resort: raw START GROUP_REPLICATION. Works when group_replication_group_seeds

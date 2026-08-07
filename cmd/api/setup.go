@@ -52,7 +52,7 @@ func buildApplication(ctx context.Context, cfg runtimeConfig) (*application, err
 		return nil, err
 	}
 
-	mysqlStore, mysqlSvc, err := buildMySQLCluster(ctx, cfg.mysql, cfg.ssh, cfg.maxConcurrentJobs, jobDB)
+	mysqlStore, mysqlSvc, err := buildMySQLCluster(ctx, cfg.mysql, cfg.ssh, cfg.server.proxyHost, cfg.maxConcurrentJobs, jobDB)
 	if err != nil {
 		if jobDB != nil {
 			_ = jobDB.Close()
@@ -60,7 +60,7 @@ func buildApplication(ctx context.Context, cfg runtimeConfig) (*application, err
 		return nil, err
 	}
 
-	pgsqlStore, pgsqlSvc, err := buildPGSQLCluster(ctx, cfg.pgsql, cfg.ssh, cfg.maxConcurrentJobs, jobDB)
+	pgsqlStore, pgsqlSvc, err := buildPGSQLCluster(ctx, cfg.pgsql, cfg.ssh, cfg.server.proxyHost, cfg.maxConcurrentJobs, jobDB)
 	if err != nil {
 		if jobDB != nil {
 			_ = jobDB.Close()
@@ -78,8 +78,8 @@ func buildApplication(ctx context.Context, cfg runtimeConfig) (*application, err
 		haproxy:              haproxySvc,
 		mysqlCluster:         mysqlSvc,
 		pgsqlCluster:         pgsqlSvc,
-		pgsqlDB:              dbmanager.NewService(pgsqlStore),
-		mysqlDB:              mysqldbmanager.NewService(mysqlStore),
+		pgsqlDB:              dbmanager.NewService(pgsqlStore, cfg.server.proxyHost),
+		mysqlDB:              mysqldbmanager.NewService(mysqlStore, cfg.server.proxyHost),
 		cipher:               cipher,
 		baseDir:              cfg.baseDir,
 		enablePprof:          cfg.enablePprof,
@@ -154,13 +154,15 @@ func buildHAProxy(ctx context.Context, cfg haproxyConfig, db *sql.DB) (*haproxy.
  *   ctx context.Context - base context for the service's background jobs.
  *   cfg clusterEngineConfig - state dir, playbook paths and Ansible tunables.
  *   ssh sshConfig - shared SSH credentials and host-key policy.
+ *   proxyAllowedIP string - the HAProxy/control-plane IP allowed to reach
+ *     client-facing DB ports and accounts (see PROXY_HOST).
  *   maxConcurrentJobs int - cap on concurrent background jobs for this engine.
  * Returns:
  *   mysqlcluster.Store - the job store (reused by the DB manager).
  *   *mysqlcluster.Service - the assembled cluster service.
  *   error - if the store cannot be created or SSH config is invalid.
  */
-func buildMySQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConfig, maxConcurrentJobs int, jobDB *sql.DB) (mysqlcluster.Store, *mysqlcluster.Service, error) {
+func buildMySQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConfig, proxyAllowedIP string, maxConcurrentJobs int, jobDB *sql.DB) (mysqlcluster.Store, *mysqlcluster.Service, error) {
 	store, err := buildMySQLStore(cfg.stateDir, jobDB)
 	if err != nil {
 		return nil, nil, fmt.Errorf("init mysql cluster store: %w", err)
@@ -173,6 +175,7 @@ func buildMySQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConf
 	runner.SetStopPlaybook(cfg.stopPlaybook)
 	runner.SetDebug(cfg.ansible.verbosity, cfg.ansible.debug, cfg.ansible.stepOutputMaxChars)
 	runner.SetSSHPolicy(ssh.policy())
+	runner.SetProxyAllowedIP(proxyAllowedIP)
 
 	svc := mysqlcluster.NewService(store, runner)
 	svc.SetMaxConcurrentJobs(maxConcurrentJobs)
@@ -195,13 +198,15 @@ func buildMySQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConf
  *   ctx context.Context - base context for the service's background jobs.
  *   cfg clusterEngineConfig - state dir, playbook paths and Ansible tunables.
  *   ssh sshConfig - shared SSH credentials and host-key policy.
+ *   proxyAllowedIP string - the HAProxy/control-plane IP allowed to reach
+ *     client-facing DB ports and accounts (see PROXY_HOST).
  *   maxConcurrentJobs int - cap on concurrent background jobs for this engine.
  * Returns:
  *   pgsqlcluster.Store - the job store (reused by the DB manager).
  *   *pgsqlcluster.Service - the assembled cluster service.
  *   error - if the store cannot be created or SSH config is invalid.
  */
-func buildPGSQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConfig, maxConcurrentJobs int, jobDB *sql.DB) (pgsqlcluster.Store, *pgsqlcluster.Service, error) {
+func buildPGSQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConfig, proxyAllowedIP string, maxConcurrentJobs int, jobDB *sql.DB) (pgsqlcluster.Store, *pgsqlcluster.Service, error) {
 	store, err := buildPGSQLStore(cfg.stateDir, jobDB)
 	if err != nil {
 		return nil, nil, fmt.Errorf("init pgsql cluster store: %w", err)
@@ -214,6 +219,7 @@ func buildPGSQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConf
 	runner.SetStopPlaybook(cfg.stopPlaybook)
 	runner.SetDebug(cfg.ansible.verbosity, cfg.ansible.debug, cfg.ansible.stepOutputMaxChars)
 	runner.SetSSHPolicy(ssh.policy())
+	runner.SetProxyAllowedIP(proxyAllowedIP)
 
 	svc := pgsqlcluster.NewService(store, runner)
 	svc.SetMaxConcurrentJobs(maxConcurrentJobs)

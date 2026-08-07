@@ -1,0 +1,42 @@
+---
+# All MySQL-node firewall rules (mysql_port + exporter ports). Shared by
+# configure_instances (normal deploy/add-member path) and the add_member
+# "refresh existing peers" play — a single definition so the two call sites
+# can't drift. mysql_port is used both for client traffic (via the proxy) and
+# node-to-node cluster management (dba.rejoin_instance,
+# reboot_cluster_from_complete_outage all connect peer-to-peer over this
+# port), so it needs both sources, never proxy-only.
+- name: Check UFW availability and status
+  ansible.builtin.command:
+    argv: [ufw, status]
+  register: _ufw_status
+  changed_when: false
+  failed_when: false
+  tags: ["configure_instances", "configure_mysql", "mysql_port_firewall"]
+
+- name: Allow MySQL port from proxy and cluster peers
+  community.general.ufw:
+    rule: allow
+    port: "{{ mysql_port | string }}"
+    proto: tcp
+    src: "{{ item }}"
+    comment: MySQL client (via proxy) and inter-node cluster management
+  loop: "{{ ([proxy_allowed_ip] + [primary_ip] + standby_ips) | unique }}"
+  when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
+  tags: ["configure_instances", "configure_mysql", "mysql_port_firewall"]
+
+# mysqld_exporter and node_exporter ship pre-baked in the VM image (not
+# provisioned by this repo) but are scraped directly by the erawan control
+# plane, so they're firewalled here rather than left fully unmanaged.
+- name: Allow exporter ports from control plane only
+  community.general.ufw:
+    rule: allow
+    port: "{{ item | string }}"
+    proto: tcp
+    src: "{{ proxy_allowed_ip }}"
+    comment: exporter scraped by erawan control plane
+  loop:
+    - "{{ mysqld_exporter_port }}"
+    - "{{ node_exporter_port }}"
+  when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
+  tags: ["configure_instances", "configure_mysql", "mysql_port_firewall"]

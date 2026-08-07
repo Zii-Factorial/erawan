@@ -15,7 +15,13 @@ etcd:
 bootstrap:
   dcs:
     ttl: 30
-    loop_wait: 10
+    # Patroni's internal HA loop only re-evaluates/reports state on this
+    # cadence — a new member's /replica endpoint won't flip to 200 until the
+    # next tick after pg_basebackup actually finishes, so this is the single
+    # biggest lever for add-member latency on small datasets. ttl is left
+    # alone: unlike loop_wait, a too-short ttl risks false-positive failover
+    # on a transient network blip, which loop_wait doesn't.
+    loop_wait: 2
     retry_timeout: 10
     maximum_lag_on_failover: 1048576
     synchronous_mode: true
@@ -29,6 +35,10 @@ bootstrap:
 {% if (postgres_max_connections | default(0) | int) >= 25 %}
         max_connections: {{ postgres_max_connections | int }}
 {% endif %}
+        shared_buffers: '{{ erawan_pg_shared_buffers_mb }}MB'
+        effective_cache_size: '{{ erawan_pg_effective_cache_size_mb }}MB'
+        maintenance_work_mem: '{{ erawan_pg_maintenance_work_mem_mb }}MB'
+        work_mem: '{{ erawan_pg_work_mem_mb }}MB'
         wal_level: replica
         hot_standby: "on"
         max_wal_senders: 10
@@ -51,17 +61,39 @@ bootstrap:
     - local all postgres peer
     - local all all peer
     - local replication all peer
+{# Patroni's own heartbeat connection (get_postgresql_status, used to query
+   its local Postgres for WAL/LSN before it will proceed with leader
+   election) connects over TCP to 127.0.0.1, not the Unix socket — the
+   "local" peer entries above don't cover it. Loopback is inherently
+   unreachable from any other host, so this doesn't reopen any of the
+   network-facing access closed elsewhere in this file. #}
+    - host all all 127.0.0.1/32 scram-sha-256
+    - host all all ::1/128 scram-sha-256
 {% if (new_user | default('')) | length > 0 %}
 {% if new_user_ssl_required | default(true) | bool %}
-    - hostssl all {{ new_user }} 0.0.0.0/0 scram-sha-256
-    - hostnossl all {{ new_user }} 0.0.0.0/0 reject
+    - hostssl all {{ new_user }} {{ proxy_allowed_ip }}/32 scram-sha-256
+    - hostnossl all {{ new_user }} {{ proxy_allowed_ip }}/32 reject
 {% else %}
-    - host all {{ new_user }} 0.0.0.0/0 scram-sha-256
+    - host all {{ new_user }} {{ proxy_allowed_ip }}/32 scram-sha-256
 {% endif %}
 {% endif %}
-    - host replication {{ replication_user }} 0.0.0.0/0 scram-sha-256
-    - host all all 0.0.0.0/0 scram-sha-256
-    - host all all ::/0 scram-sha-256
+{# replication is a distinct pseudo-database in pg_hba — a "database: all"
+   entry below does not implicitly match it, so it needs its own peer-scoped
+   entries. Streaming replication is always node-to-node, never via the proxy. #}
+{% for host_name in groups['all'] %}
+    - host replication {{ replication_user }} {{ hostvars[host_name].ansible_host }}/32 scram-sha-256
+{% endfor %}
+{# Catch-all for postgres_superuser/patroni_admin/generic access — scoped to
+   cluster peers plus the proxy/control-plane node, never the whole internet.
+   The proxy IP is included because the erawan control plane (same machine as
+   the proxy) manages users/databases over postgres-superuser connections —
+   the app-user entries above don't cover those. The app user's stricter
+   hostnossl-reject pair still wins for that user: pg_hba is first-match.
+   No IPv6 rule: nothing in this deployment uses IPv6. #}
+{% for host_name in groups['all'] %}
+    - host all all {{ hostvars[host_name].ansible_host }}/32 scram-sha-256
+{% endfor %}
+    - host all all {{ proxy_allowed_ip }}/32 scram-sha-256
   users:
     {{ patroni_admin_user }}:
       password: {{ patroni_admin_password | to_json }}

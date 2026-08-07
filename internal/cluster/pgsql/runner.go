@@ -27,6 +27,7 @@ type Runner struct {
 	streamLogs           bool
 	maxOutputChars       int
 	sshPolicy            core.SSHPolicy
+	proxyAllowedIP       string
 }
 
 /**
@@ -95,6 +96,20 @@ func (r *Runner) SetStopPlaybook(path string) { r.stopPlaybook = path }
  *   p core.SSHPolicy - the p (core.SSHPolicy)
  */
 func (r *Runner) SetSSHPolicy(p core.SSHPolicy) { r.sshPolicy = p }
+
+/**
+ * SetProxyAllowedIP configures the single source IP (the HAProxy/control-plane
+ * node) permitted to reach client-facing DB ports and accounts. Cluster-internal
+ * node-to-node access (replication, Patroni/etcd coordination) is scoped
+ * separately by peer IP, not by this value.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Params:
+ *   ip string - the allowed proxy IP
+ */
+func (r *Runner) SetProxyAllowedIP(ip string) { r.proxyAllowedIP = ip }
 
 /**
  * SetDebug.
@@ -285,6 +300,7 @@ func (r *Runner) run(ctx context.Context, cfg runConfig) StepResult {
 		"etcd_client_port":            2379,
 		"etcd_peer_port":              2380,
 		"step_timeout_seconds":        stepTimeout,
+		"proxy_allowed_ip":            r.proxyAllowedIP,
 	}
 	return core.AnsibleRun(ctx, core.AnsibleSpec{
 		Bin:             r.ansibleBin,
@@ -380,6 +396,7 @@ func (r *Runner) runMember(ctx context.Context, cfg memberRunConfig, playbook, s
 		"etcd_peer_port":              2380,
 		"expected_cluster_nodes":      len(effectiveStandbys) + 1,
 		"step_timeout_seconds":        stepTimeout,
+		"proxy_allowed_ip":            r.proxyAllowedIP,
 	}
 	return core.AnsibleRun(ctx, core.AnsibleSpec{
 		Bin:             r.ansibleBin,

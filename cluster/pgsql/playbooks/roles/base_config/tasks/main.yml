@@ -91,23 +91,10 @@
     - patroni
   tags: ["base_config"]
 
-- name: Check UFW availability and status
-  ansible.builtin.command:
-    argv: [ufw, status]
-  register: _ufw_status
-  changed_when: false
-  failed_when: false
+- name: Apply etcd/Patroni/PostgreSQL peer firewall rules
+  ansible.builtin.import_role:
+    name: pgsql_peer_firewall
   tags: ["base_config"]
 
-- name: Allow required ports through UFW
-  ansible.builtin.command:
-    argv: [ufw, allow, "{{ item }}/tcp"]
-  loop:
-    - "{{ etcd_client_port | string }}"
-    - "{{ etcd_peer_port | string }}"
-    - "{{ patroni_rest_port | string }}"
-    - "{{ postgres_port | string }}"
-    - "{{ postgres_exporter_port | string }}"
-  when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
-  changed_when: false
-  tags: ["base_config"]
+# Exporter-port rules moved into pgsql_peer_firewall itself so start/recover
+# (cluster_bootstrap) re-applies them too, not just deploy/add-member.

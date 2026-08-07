@@ -22,7 +22,119 @@
     - preflight
 
 # ---------------------------------------------------------------------------
-# PLAY 3 — Install, configure, and start etcd + Patroni on the new node
+# PLAY 3 — Refresh etcd/Patroni/PostgreSQL firewall rules on existing nodes so
+#           they allow the new member's IP. Must run before Play 4: the new
+#           node's etcd/Patroni connect OUT to the existing primary to join,
+#           and the primary's rule (set at its own deploy time) doesn't know
+#           about the new member yet — without this it's dropped once UFW is
+#           actually enforcing.
+# ---------------------------------------------------------------------------
+- name: Refresh PostgreSQL cluster firewall on existing nodes
+  hosts: pgsql_primary:pgsql_standby
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - pgsql_peer_firewall
+
+# ---------------------------------------------------------------------------
+# PLAY 4 — Refresh pg_hba in the Patroni DCS config to allow the new member's
+#           replication connection. Unlike UFW rules (re-templated and
+#           re-applied per node), pg_hba is centrally owned by the DCS once
+#           the cluster is bootstrapped — patroni.yml.j2's bootstrap.dcs.pg_hba
+#           only ever takes effect at the cluster's *initial* bootstrap, so it
+#           never sees members added afterward. Without this, the new member's
+#           pg_basebackup against the primary is rejected/dropped and it sits
+#           in "creating replica" forever. Runs once against the primary,
+#           since pg_hba is a single cluster-wide value, not per-node.
+# ---------------------------------------------------------------------------
+- name: Refresh pg_hba for the new member
+  hosts: pgsql_primary
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Get current Patroni DCS config
+      ansible.builtin.uri:
+        url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/config"
+        method: GET
+        url_username: "{{ patroni_admin_user }}"
+        url_password: "{{ patroni_admin_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: _current_patroni_config
+      no_log: true
+      run_once: true
+
+    # bootstrap.pg_hba is written into pg_hba.conf at initdb time but is NOT
+    # stored in the DCS — a freshly bootstrapped cluster has no
+    # postgresql.pg_hba in /config at all. PATCHing "existing + new lines"
+    # against an empty default would therefore REPLACE the effective pg_hba
+    # on every node with just the two new-member lines, locking out Patroni's
+    # own loopback heartbeat, the proxy app user, and every existing peer.
+    # Seed the baseline from the primary's live pg_hba.conf instead (same
+    # approach as the Go dbmanager's patchPatroniPgHba).
+    # Derives erawan_pg_data_directory for the slurp below; every task in the
+    # role is guarded by "is not defined", so this is a no-op if another play
+    # already ran it on this host.
+    - name: Discover PostgreSQL runtime facts on the primary
+      ansible.builtin.import_role:
+        name: runtime_facts
+
+    # Patroni manages pg_hba.conf inside the data directory, so root reads it
+    # straight off disk — a psql "SHOW hba_file" round-trip proved fragile
+    # here (Debian's wrapper resolved the wrong port; become_user ran as root
+    # under pipelining).
+    - name: Read the primary's live pg_hba.conf
+      ansible.builtin.slurp:
+        src: "{{ erawan_pg_data_directory }}/pg_hba.conf"
+      register: _hba_file
+      no_log: true
+      run_once: true
+      when: (_current_patroni_config.json.postgresql.pg_hba | default([])) | length == 0
+
+    - name: Resolve the pg_hba baseline
+      ansible.builtin.set_fact:
+        _pg_hba_base: >-
+          {{
+            (_current_patroni_config.json.postgresql.pg_hba | default([]))
+            if ((_current_patroni_config.json.postgresql.pg_hba | default([])) | length > 0)
+            else (
+              (_hba_file.content | b64decode).splitlines()
+              | map('trim')
+              | select('match', '^(local|host)')
+              | list
+            )
+          }}
+      no_log: true
+      run_once: true
+
+    - name: Refresh pg_hba to include the new member
+      ansible.builtin.uri:
+        url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/config"
+        method: PATCH
+        url_username: "{{ patroni_admin_user }}"
+        url_password: "{{ patroni_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          postgresql:
+            pg_hba: >-
+              {{
+                _pg_hba_base
+                + [
+                    'host replication ' ~ replication_user ~ ' ' ~ new_member_ip ~ '/32 scram-sha-256',
+                    'host all all ' ~ new_member_ip ~ '/32 scram-sha-256'
+                  ]
+              }}
+        status_code: 200
+      no_log: true
+      run_once: true
+      when: (new_member_ip ~ '/32') not in (_pg_hba_base | join('\n'))
+
+# ---------------------------------------------------------------------------
+# PLAY 5 — Install, configure, and start etcd + Patroni on the new node
 #           Uses base_config and configure_node with etcd "existing" state.
 # ---------------------------------------------------------------------------
 - name: Set up new PostgreSQL standby
@@ -39,7 +151,7 @@
     - add_member_join
 
 # ---------------------------------------------------------------------------
-# PLAY 4 — Verify cluster health on all nodes
+# PLAY 6 — Verify cluster health on all nodes
 # ---------------------------------------------------------------------------
 - name: Verify cluster after member addition
   hosts: all

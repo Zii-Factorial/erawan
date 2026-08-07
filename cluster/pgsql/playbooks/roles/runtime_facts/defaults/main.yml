@@ -1,0 +1,11 @@
+---
+# PostgreSQL has no built-in equivalent of MySQL's innodb_dedicated_server,
+# so shared_buffers/effective_cache_size/maintenance_work_mem/work_mem are
+# derived here from detected node RAM using standard pgtune/EDB heuristics.
+postgres_shared_buffers_percent: 25
+postgres_effective_cache_size_percent: 75
+postgres_maintenance_work_mem_percent: 10
+postgres_maintenance_work_mem_ceiling_mb: 1024
+postgres_work_mem_cpu_divisor: 16
+postgres_work_mem_floor_mb: 4
+postgres_work_mem_ceiling_mb: 256

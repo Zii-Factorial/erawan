@@ -11,7 +11,23 @@
     - configure_instances
 
 # ---------------------------------------------------------------------------
-# PLAY 2 — Add new instance to InnoDB Cluster from primary
+# PLAY 2 — Refresh mysql_port firewall rules on existing nodes so they allow
+#           the new member's IP. Must run before Play 3: distributed recovery
+#           connects the new member OUT to the primary (donor) over mysql_port,
+#           and the primary's rule (set at its own deploy time) doesn't know
+#           about the new member yet — without this it's dropped once UFW is
+#           actually enforcing.
+# ---------------------------------------------------------------------------
+- name: Refresh MySQL port firewall on existing cluster nodes
+  hosts: mysql_primary:mysql_standby
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - mysql_port_firewall
+
+# ---------------------------------------------------------------------------
+# PLAY 3 — Add new instance to InnoDB Cluster from primary
 # ---------------------------------------------------------------------------
 - name: Add new member to InnoDB Cluster
   hosts: mysql_primary
@@ -22,7 +38,7 @@
     - add_member
 
 # ---------------------------------------------------------------------------
-# PLAY 3 — Verify cluster health
+# PLAY 4 — Verify cluster health
 # ---------------------------------------------------------------------------
 - name: Verify cluster after member addition
   hosts: mysql_primary
@@ -33,7 +49,7 @@
     - verify_cluster
 
 # ---------------------------------------------------------------------------
-# PLAY 4 — Install MySQL primary-check endpoint on the new member
+# PLAY 5 — Install MySQL primary-check endpoint on the new member
 # ---------------------------------------------------------------------------
 - name: Install MySQL primary-check endpoint on new member
   hosts: mysql_new_member
