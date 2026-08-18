@@ -536,13 +536,18 @@ func (s *Service) Recover(ctx context.Context, jobID string) (*Job, error) {
 // for the control plane and the control plane has no firewall grant for its
 // address, both of which this step restores before Patroni is asked to start.
 func (s *Service) recoveryStepsFor(spec StoredSpec) []step {
-	steps := make([]step, 0, 3)
+	steps := make([]step, 0, 4)
 	if spec.ControlPlaneDCS {
 		steps = append(steps, step{Name: controlPlaneDCSStep, Tag: controlPlaneDCSStep})
 	}
 	return append(steps,
 		step{Name: "cluster_bootstrap", Tag: "cluster_bootstrap"},
 		step{Name: "verify_cluster", Tag: "verify_cluster"},
+		// Same gap add_member had: nothing else installs the exporter unit, so
+		// a node that a scale operation rebuilt from a stock image reaches this
+		// point healthy and then refuses every metrics scrape. The role is
+		// idempotent and a no-op on nodes that already run it.
+		step{Name: "setup_exporters", Tag: "setup_exporters"},
 	)
 }
 

@@ -5,11 +5,41 @@
   tags: ["setup_exporters"]
 
 # ── 1. Create the monitoring role on the primary (once) ─────────────────────
+# primary_ip is the *stored* primary from the portal spec. This role now runs on
+# start/recover and add-member as well as deploy, and both of those follow
+# operations that reboot VMs — so Patroni may have failed over and that address
+# may now be a read-only standby, where CREATE ROLE fails with "cannot execute
+# ... in a read-only transaction" and takes the whole run down with it. Same
+# discovery verify_cluster does, for the same reason: the REST /cluster view
+# reads the DCS, so any member answers it truthfully.
+- name: Read the Patroni cluster view
+  ansible.builtin.uri:
+    url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/cluster"
+    return_content: true
+  register: _exporter_cluster_view
+  # A stored primary that is down must not fail this: the fallback below is the
+  # address we would have used anyway.
+  failed_when: false
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ groups['pgsql_primary'][0] }}"
+  tags: ["setup_exporters"]
+
+- name: Determine the current Patroni leader address
+  ansible.builtin.set_fact:
+    exporter_leader_ip: >-
+      {{ ((_exporter_cluster_view.json | default({})).members | default([]))
+         | selectattr('role', 'equalto', 'leader')
+         | map(attribute='host')
+         | first | default(primary_ip) }}
+  run_once: true
+  tags: ["setup_exporters"]
+
 - name: Create postgres_exporter monitoring role
   no_log: true
   ansible.builtin.shell: |
     set -euo pipefail
-    psql -h "{{ primary_ip }}" -p "{{ postgres_port }}" \
+    psql -h "{{ exporter_leader_ip | default(primary_ip) }}" -p "{{ postgres_port }}" \
          -U "{{ postgres_superuser }}" -d postgres -v ON_ERROR_STOP=1 <<'SQL'
     DO $$
     BEGIN

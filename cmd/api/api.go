@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof handlers on the loopback pprof server
@@ -68,7 +69,7 @@ func (app *application) mount() *chi.Mux {
 
 	r.Get("/health", app.healthCheckHandler)
 
-	haproxyH := haproxyapi.New(app.haproxy)
+	haproxyH := haproxyapi.New(app.haproxy, pgsqlDCSReleaser{svc: app.pgsqlCluster})
 	r.Route("/haproxy", func(r chi.Router) {
 		r.Post("/config/mysql", haproxyH.CreateMySQLConfig)
 		r.Patch("/config/mysql", haproxyH.AddMySQLMember)
@@ -235,4 +236,40 @@ func bodyLimit(limit int64) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// pgsqlDCSReleaser adapts the PostgreSQL cluster service to the proxy layer's
+// DCSReleaser, so deleting a cluster's HAProxy config also releases its tenant
+// on the shared control plane. Only PostgreSQL needs it: MySQL carries its own
+// quorum and never takes a tenant on the control plane.
+type pgsqlDCSReleaser struct {
+	svc *pgsqlcluster.Service
+}
+
+/**
+ * ReleaseDCS starts the release job for one cluster and returns its job ID.
+ *
+ * Receiver:
+ *   p pgsqlDCSReleaser - value receiver; the method operates on a copy
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   jobID string - the deploy job identifying the cluster to release
+ *
+ * Returns:
+ *   string - the release job's ID
+ *   error - non-nil when the release could not be started
+ */
+func (p pgsqlDCSReleaser) ReleaseDCS(ctx context.Context, jobID string) (string, error) {
+	if p.svc == nil {
+		return "", fmt.Errorf("postgresql cluster service is not configured")
+	}
+	job, err := p.svc.ReleaseDCS(ctx, jobID)
+	if err != nil {
+		return "", err
+	}
+	if job == nil {
+		return "", nil
+	}
+	return job.ID, nil
 }

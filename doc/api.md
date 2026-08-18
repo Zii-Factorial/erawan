@@ -121,12 +121,37 @@ Add a single node to an existing PostgreSQL HAProxy backend.
 
 ### `DELETE /haproxy/config`
 
-Remove a HAProxy tenant config and reload.
+Remove a HAProxy tenant config and reload. This is how a cluster is
+decommissioned, so it also releases that cluster's tenant on the shared control
+plane — its etcd role, user and keys, its client certificate, and the firewall
+grants held for its nodes.
 
 **Request:**
 ```json
-{ "port": 25041 }
+{ "port": 25041, "job_id": "8c84969fef4794ea8bd1fc1c" }
 ```
+
+`job_id` is the cluster's deploy job. It is **required for the control-plane
+release** and deliberately not inferred from the config's backend addresses:
+node IPs are recycled, so address matching can resolve to a different, live
+cluster — and releasing the wrong tenant deletes that cluster's Patroni keys and
+takes it down. Omitting it leaves the proxy delete working exactly as before.
+
+The response always states what happened on the control plane, because a silent
+miss is how an orphaned credential and an open client-port grant outlive the
+cluster they belonged to:
+
+| `control_plane` | Meaning |
+|-----------------|---------|
+| `releasing` | Release job started; its ID is in `release_job_id` |
+| `skipped: no job_id supplied, tenant not released` | Proxy config deleted, control plane untouched |
+| `skipped: no control plane configured` | This deployment uses per-node etcd |
+| `release failed: …` | Config deleted, tenant **not** released — the cause is included |
+
+The proxy config is removed and HAProxy reloaded before this runs, so a
+control-plane failure never fails the delete; the cluster is unreachable either
+way. Re-run `DELETE /cluster/pgsql/dcs` with the same job ID to retry a failed
+release.
 
 ---
 
