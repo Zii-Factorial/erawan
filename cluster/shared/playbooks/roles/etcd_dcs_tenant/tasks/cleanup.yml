@@ -60,30 +60,37 @@
 
 # The tenant's client certificate goes with the tenant. Left behind it would
 # stay valid until its expiry, and a cluster later created under the same name
-# would inherit it from the mint step's one-time `creates:` guard rather than
-# being issued its own.
+# would adopt it on its next provisioning run rather than being issued its own.
 #
-# The parent-directory entries are the pre-per-engine layout; a decommission
-# that runs against a cluster deployed before that change has to clear both, or
-# the stale pair outlives the tenant it belonged to.
-- name: Remove the tenant client certificate from the control plane
+# Every pair the tenant ever held is removed, not just the current one: a mint
+# stamps the pair with the time it issued it, so a tenant that was re-issued at
+# some point (a CN certificate retired, a rotation done by hand) has more than
+# one, and naming only the newest would strand the rest.
+#
+# The pattern is anchored on the whole stem — "<cluster>-user-" — which is what
+# makes matching safe here. A bare glob on the cluster name would also catch a
+# different cluster whose name merely starts with this one (db-2 inside db-20),
+# and deleting a live cluster's certificate is far worse than leaving a dead one
+# behind; the "-user-" that follows the name can only end this tenant's stem.
+- name: Find every client certificate this tenant holds
+  ansible.builtin.find:
+    paths: "{{ dcs_client_cert_dir }}"
+    patterns: "{{ dcs_client_cert_prefix }}-*.pem"
+    file_type: file
+  register: _dcs_tenant_certs
+
+- name: Remove the tenant client certificates from the control plane
   ansible.builtin.file:
     path: "{{ item }}"
     state: absent
-  loop:
-    # Current scheme: per-engine directory, named after the cluster.
-    - "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}.pem"
-    - "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}-key.pem"
-    # Per-engine directory but named after the etcd user — what a control plane
-    # provisioned between the two changes holds. Listed explicitly rather than
-    # matched by glob: a glob on the cluster name would also catch a different
-    # cluster whose name contains this one (db-2 inside db-20), and deleting a
-    # live cluster's certificate is far worse than leaving a dead one behind.
-    - "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem"
-    - "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}-key.pem"
-    # Flat layout, from before certificates were filed per engine.
-    - "{{ dcs_client_cert_dir | dirname }}/{{ dcs_tenant_user }}.pem"
-    - "{{ dcs_client_cert_dir | dirname }}/{{ dcs_tenant_user }}-key.pem"
+  loop: >-
+    {{ (_dcs_tenant_certs.files | default([]) | map(attribute='path') | list) + [
+         dcs_client_cert_dir ~ '/' ~ dcs_client_cert_prefix ~ '.pem',
+         dcs_client_cert_dir ~ '/' ~ dcs_client_cert_prefix ~ '-key.pem',
+         dcs_client_cert_dir ~ '/' ~ dcs_tenant_user ~ '.pem',
+         dcs_client_cert_dir ~ '/' ~ dcs_tenant_user ~ '-key.pem',
+         dcs_client_cert_dir | dirname ~ '/' ~ dcs_tenant_user ~ '.pem',
+         dcs_client_cert_dir | dirname ~ '/' ~ dcs_tenant_user ~ '-key.pem' ] }}
 
 - name: Check UFW availability and status on the control plane
   ansible.builtin.command:

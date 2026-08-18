@@ -121,13 +121,15 @@
     mode: "0700"
   when: dcs_client_cert_enabled | bool
 
-# Two kinds of superseded pair, both of which the `creates:` guard below would
-# otherwise preserve forever:
+# Three kinds of superseded pair, all of which the resolve step below would
+# otherwise adopt and keep in service forever:
 #
 #   - one carrying a CommonName, which fails every DCS request this tenant makes
-#     (see the note above), and
+#     (see the note above),
 #   - one at the old flat path <parent>/<prefix>-<cluster>-user.pem, from before
-#     certificates were filed per engine.
+#     certificates were filed per engine, and
+#   - one at the un-timestamped name <cluster>-user.pem, from before a minted
+#     pair carried the time it was issued.
 #
 # Clearing them here is what lets the mint step re-issue, and this playbook runs
 # on every deploy, start/recover and add-member — so an affected tenant heals on
@@ -137,75 +139,132 @@
 - name: Retire superseded tenant client certificates
   ansible.builtin.shell: |
     set -euo pipefail
-    cert="{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}.pem"
-    legacy_dir="{{ dcs_client_cert_dir | dirname }}"
+    dir="{{ dcs_client_cert_dir }}"
+    legacy_dir="$(dirname "$dir")"
+    prefix="{{ dcs_client_cert_prefix }}"
+
+    # Both halves of a pair always share a stem, whatever scheme named it.
+    retire() {
+      rm -f "$1" "${1%.pem}-key.pem"
+      echo "$2 $(basename "${1%.pem}")"
+    }
 
     if [ -f "$legacy_dir/{{ dcs_tenant_user }}.pem" ]; then
-      rm -f "$legacy_dir/{{ dcs_tenant_user }}.pem" "$legacy_dir/{{ dcs_tenant_user }}-key.pem"
-      echo "retired-legacy-path {{ dcs_tenant_user }}"
+      retire "$legacy_dir/{{ dcs_tenant_user }}.pem" retired-legacy-path
     fi
 
     # Same tenant, per-engine directory, but named after the etcd user — what a
     # control plane provisioned between the directory change and the rename
     # holds. Left in place it is a valid credential for a cluster that may be
     # long gone, and no cleanup would ever name it.
-    if [ -f "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem" ]; then
-      rm -f "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem" \
-            "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}-key.pem"
-      echo "retired-superseded-name {{ dcs_tenant_user }}"
+    if [ -f "$dir/{{ dcs_tenant_user }}.pem" ]; then
+      retire "$dir/{{ dcs_tenant_user }}.pem" retired-superseded-name
     fi
 
-    if [ ! -f "$cert" ]; then
-      exit 0
+    # Named after the cluster but with no issue time, from before the stamp.
+    # Retired rather than adopted so every pair in the directory can be read the
+    # same way, and so this tenant is dated from its next operation on.
+    if [ -f "$dir/$prefix.pem" ]; then
+      retire "$dir/$prefix.pem" retired-untimestamped
     fi
-    # sep_multiline puts one RDN per line, so a CN is matched as its own field
-    # and never as a substring of some other value. The indent openssl uses for
-    # those lines has changed between releases, hence the leading " *".
-    if openssl x509 -in "$cert" -noout -subject -nameopt sep_multiline | grep -qE "^ *CN="; then
-      rm -f "$cert" "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}-key.pem"
-      echo "retired-cn-certificate {{ dcs_client_cert_name }}"
-    fi
+
+    # An unmatched glob expands to itself, hence the -f guard rather than a
+    # nullglob this shell would have to be told to set.
+    for cert in "$dir/$prefix"-*.pem; do
+      case "$cert" in *-key.pem) continue ;; esac
+      [ -f "$cert" ] || continue
+      # sep_multiline puts one RDN per line, so a CN is matched as its own field
+      # and never as a substring of some other value. The indent openssl uses for
+      # those lines has changed between releases, hence the leading " *".
+      if openssl x509 -in "$cert" -noout -subject -nameopt sep_multiline | grep -qE "^ *CN="; then
+        retire "$cert" retired-cn-certificate
+      fi
+    done
   args:
     executable: /bin/bash
   register: _dcs_cert_retire
   changed_when: "'retired-' in (_dcs_cert_retire.stdout | default(''))"
   when: dcs_client_cert_enabled | bool
 
-# `creates:` makes this a one-time mint per tenant: re-running provisioning
-# must not hand a live cluster a new certificate on every deploy, start and
-# add-member, and a stable pair is also what makes rotation an explicit act
-# (delete the pair, re-run) rather than a side effect.
-- name: Sign a client certificate for the tenant
+# Evaluated once, here, rather than inside the name below: `now()` is resolved
+# at every template expansion, so a lazily-templated name would drift between
+# the openssl call that writes the pair and the read that publishes it.
+- name: Stamp the time a newly minted certificate is issued
+  ansible.builtin.set_fact:
+    _dcs_cert_stamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+  when: dcs_client_cert_enabled | bool
+
+# Minting stays one-time per tenant: re-running provisioning must not hand a
+# live cluster a new certificate on every deploy, start and add-member, and a
+# stable pair is also what makes rotation an explicit act (delete the pair,
+# re-run) rather than a side effect. What the timestamp adds is that a pair is
+# never silently overwritten or inherited across incarnations of one cluster
+# name — a tenant re-created after a cleanup gets a visibly different file, and
+# the directory says when each credential was issued rather than only which
+# cluster holds it.
+- name: Resolve or mint the tenant client certificate
   ansible.builtin.shell: |
     set -euo pipefail
     umask 077
     cd "{{ dcs_client_cert_dir }}"
+    prefix="{{ dcs_client_cert_prefix }}"
+
+    # Newest pair wins. Names sort chronologically, but mtime is used so a pair
+    # placed here by hand (rotation, an out-of-band re-issue) is ordered too.
+    # Only a complete pair counts: half of one is not a usable credential.
+    name=""
+    for cert in "$prefix"-*.pem; do
+      case "$cert" in *-key.pem) continue ;; esac
+      [ -f "$cert" ] || continue
+      [ -f "${cert%.pem}-key.pem" ] || continue
+      if [ -z "$name" ] || [ "$cert" -nt "$name.pem" ]; then
+        name="${cert%.pem}"
+      fi
+    done
+
+    if [ -n "$name" ]; then
+      echo "client-cert-present $name"
+      exit 0
+    fi
+
+    name="$prefix-{{ _dcs_cert_stamp }}"
 
     openssl req -new -newkey rsa:2048 -nodes \
-      -keyout "{{ dcs_client_cert_name }}-key.pem" \
-      -out "{{ dcs_client_cert_name }}.csr" \
+      -keyout "$name-key.pem" \
+      -out "$name.csr" \
       -subj "/O=erawan"
 
     # clientAuth is not optional: the Go TLS stack inside etcd rejects a
     # client certificate that does not carry that extended key usage.
     # (No apostrophes in this block — the free-form shell argument splitter
     # reads one as an unterminated quote and fails the whole task.)
-    printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n' > "{{ dcs_client_cert_name }}.ext"
+    printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n' > "$name.ext"
 
     openssl x509 -req -sha256 \
-      -in "{{ dcs_client_cert_name }}.csr" \
+      -in "$name.csr" \
       -CA "{{ dcs_ca_file }}" -CAkey "{{ dcs_ca_key_file }}" \
       -CAcreateserial -CAserial "{{ dcs_client_cert_serial }}" \
-      -extfile "{{ dcs_client_cert_name }}.ext" \
+      -extfile "$name.ext" \
       -days {{ dcs_client_cert_days }} \
-      -out "{{ dcs_client_cert_name }}.pem"
+      -out "$name.pem"
 
-    rm -f "{{ dcs_client_cert_name }}.csr" "{{ dcs_client_cert_name }}.ext"
-    chmod 0600 "{{ dcs_client_cert_name }}-key.pem" "{{ dcs_client_cert_name }}.pem"
-    echo "client-cert-created {{ dcs_client_cert_name }}"
+    rm -f "$name.csr" "$name.ext"
+    chmod 0600 "$name-key.pem" "$name.pem"
+    echo "client-cert-created $name"
   args:
     executable: /bin/bash
-    creates: "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}.pem"
+  register: _dcs_cert_resolve
+  changed_when: "'client-cert-created ' in (_dcs_cert_resolve.stdout | default(''))"
+  when: dcs_client_cert_enabled | bool
+
+# The name the rest of the role reads the pair by. openssl writes its progress
+# to stderr, so the marker line is matched rather than the last line taken.
+- name: Record which certificate this tenant holds
+  ansible.builtin.set_fact:
+    dcs_client_cert_name: >-
+      {{ (_dcs_cert_resolve.stdout_lines
+          | select('match', '^client-cert-(created|present) ')
+          | last).split(' ') | last }}
   when: dcs_client_cert_enabled | bool
 
 # Published for the client play, which installs these on the cluster nodes: the

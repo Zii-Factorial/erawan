@@ -36,7 +36,19 @@ dcs_client_cert_days: 3650
 # Certificates are named after the cluster, not after the etcd user: the engine
 # directory above already disambiguates, so repeating the engine in the filename
 # would only make it longer.
-dcs_client_cert_name: "{{ dcs_scope }}-user"
+#
+# This is only the stem. Provisioning appends the UTC time it minted the pair —
+# <cluster>-user-<YYYYMMDDTHHMMSSZ>.pem, with the key beside it as
+# ...-<stamp>-key.pem — and resolves the full name into dcs_client_cert_name for
+# the rest of the role. A tenant keeps the pair it was issued (provisioning
+# re-runs adopt it rather than re-minting); what the stamp buys is that two
+# incarnations of one cluster name can never occupy the same filename, so a pair
+# is never silently overwritten or inherited, and the directory shows when each
+# credential was issued instead of only which cluster holds it.
+#
+# Cleanup deletes <prefix>-* — anchored on the whole stem, so a tenant never
+# matches a longer name that merely starts with its own (db-2 against db-20).
+dcs_client_cert_prefix: "{{ dcs_scope }}-user"
 # X.509 serial numbers must be unique per CA, not per directory — one serial
 # file per engine would let two engines mint different certificates carrying the
 # same serial from the same CA. Kept one level up, where every engine shares it.

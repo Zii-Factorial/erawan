@@ -29,7 +29,7 @@ certificate on the shared control plane:
 role  patroni-<cluster>-role   readwrite on /db/patroni/<cluster>/
 user  patroni-<cluster>-user   granted that role and nothing else
 keys  /db/patroni/<cluster>/…  Patroni's leader, config, members, …
-cert  <engine>/<cluster>-user.pem, subject /O=erawan (no CN)
+cert  <engine>/<cluster>-user-<UTC stamp>.pem, subject /O=erawan (no CN)
 ```
 
 etcd RBAC is prefix-based, which is what keeps tenants off each other's keys on
@@ -57,7 +57,7 @@ Certificates are filed per engine — `dcs_client_cert_dir` is
 `/etc/etcd/ssl/erawan-clients/<engine>/`, derived by
 `core.ControlPlane.ForEngine`. That directory is what keeps engines apart: two
 engines each deploying a cluster named `db-0001` would otherwise mint to the
-same filename, and the one-time guard below would hand the second engine the
+same stem, and the adopt-if-present rule below would hand the second engine the
 first one's credential. The CA serial counter stays one level up, shared —
 X.509 serial numbers must be unique per CA, not per directory.
 
@@ -68,9 +68,18 @@ nodes on a user nothing converges and re-point the next redeploy at an empty
 keyspace. A second engine gets its own via `dcs_namespace` /
 `dcs_tenant_user`, as a deployment decision.
 
-Minting is otherwise one-time per tenant (`creates:`), so the routine re-runs
-below never hand a live cluster a new credential; rotation means deleting the
-pair under `dcs_client_cert_dir` and re-running. Set
+A minted pair is stamped with the UTC time it was issued —
+`<cluster>-user-<YYYYMMDDTHHMMSSZ>.pem`, key beside it as `…-<stamp>-key.pem`.
+Minting is still one-time per tenant: provisioning adopts the newest complete
+pair already in the directory and only mints when there is none, so the routine
+re-runs below never hand a live cluster a new credential. What the stamp buys is
+that two incarnations of one cluster name cannot occupy the same filename — a
+tenant re-created after a cleanup is visibly a new credential rather than a file
+silently overwritten, and the directory says when each was issued. Rotation
+still means deleting the pair under `dcs_client_cert_dir` and re-running; the
+re-issued pair carries the new time. Cleanup removes every pair matching
+`<cluster>-user-*`, so a tenant that was re-issued at some point leaves none
+behind. Set
 `dcs_client_cert_enabled: false` for a control plane that does not require them
 — it is also the only setting that needs the CA private key on the control
 plane.

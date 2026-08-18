@@ -297,7 +297,7 @@ What each cluster is issued on the control plane:
 | Role | `patroni-<cluster>-role`, `readwrite` on `/db/patroni/<cluster>/` |
 | User | `patroni-<cluster>-user`, granted that role only |
 | Keys | `/db/patroni/<cluster>/…` — leader lock, config, members |
-| Client cert | `<engine>/<cluster>-user.pem` on the control plane, **no CommonName** (see below) |
+| Client cert | `<engine>/<cluster>-user-<UTC stamp>.pem` on the control plane, **no CommonName** (see below) |
 
 etcd RBAC is prefix-based, so tenants cannot read or write each other's keys.
 Each node holds the control plane's CA (`/etc/patroni/etcd-ca.pem`), its tenant
@@ -308,9 +308,14 @@ The client certificate is what a control plane running `client-cert-auth: true`
 demands: it aborts the TLS handshake for a client presenting none, which shows
 up on the node as `tlsv13 alert certificate required` and leaves Patroni looping
 on `waiting on etcd`. Certificates are minted once per tenant from the CA and
-left in place — a redeploy or start/recover never re-mints, so a live cluster
-cannot lose its credential to a routine operation. Rotation is deliberate:
-delete the pair under `/etc/etcd/ssl/erawan-clients/` and re-run the deploy.
+left in place — a redeploy or start/recover adopts the pair already on disk and
+never re-mints, so a live cluster cannot lose its credential to a routine
+operation. Each minted pair is named for the UTC time it was issued, so a
+cluster name re-used after a decommission gets a visibly distinct file instead
+of one silently overwritten or inherited, and the directory dates every
+credential on it. Rotation is deliberate: delete the pair under
+`/etc/etcd/ssl/erawan-clients/` and re-run the deploy — the new pair carries the
+time it was re-issued.
 Set `CONTROL_PLANE_ETCD_CLIENT_CERT=false` for a control plane that does not
 require client certificates.
 
@@ -325,14 +330,14 @@ Certificates are filed per engine on the control plane:
 /etc/etcd/ssl/erawan-clients/
   ca.srl                      one serial counter — X.509 serials are unique per CA
   pgsql/
-    db-0001-user.pem
-    db-0001-user-key.pem
+    db-0001-user-20260818T110512Z.pem        minted 2026-08-18 11:05:12 UTC
+    db-0001-user-20260818T110512Z-key.pem
 ```
 
 The engine directory is what keeps two engines apart. Without it, a PostgreSQL
-and a (say) Redis cluster both named `db-0001` mint to the same filename, and the
-one-time `creates:` guard silently hands the second engine the first one's
-credential. `core.ControlPlane.ForEngine` derives the directory; the pre-existing
+and a (say) Redis cluster both named `db-0001` mint to the same stem, and the
+rule that adopts an existing pair silently hands the second engine the first
+one's credential. `core.ControlPlane.ForEngine` derives the directory; the pre-existing
 flat layout is migrated on the next provisioning run and removed on cleanup.
 
 Note what `ForEngine` deliberately does **not** scope: the etcd user
