@@ -256,6 +256,39 @@ func (h *Handler) StopJob(w http.ResponseWriter, r *http.Request) {
 }
 
 /**
+ * ReleaseDCS releases the cluster's namespace on the shared control-plane etcd:
+ * its Patroni keys, its etcd user and role, and its nodes' access to the
+ * control plane. Call it when a cluster is decommissioned — the tenant's
+ * objects are named after the cluster, so leaving them behind accumulates state
+ * on shared infrastructure and would be inherited by a later cluster of the
+ * same name.
+ *
+ * It removes coordination state only, never PostgreSQL data — but a cluster
+ * whose nodes are still running loses its DCS, so release it after stopping or
+ * destroying the nodes.
+ *
+ * Receiver:
+ *   h *Handler - pointer receiver; the method may mutate this Handler instance
+ *
+ * Params:
+ *   w http.ResponseWriter - the HTTP response writer the result is written to
+ *   r *http.Request - the incoming HTTP request
+ */
+func (h *Handler) ReleaseDCS(w http.ResponseWriter, r *http.Request) {
+	jobID, err := decodeServiceOpRequest(r)
+	if err != nil {
+		render.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	job, err := h.cluster.ReleaseDCS(r.Context(), jobID)
+	if err != nil {
+		render.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	render.Accepted(w, "PostgreSQL control-plane DCS release initiated", job)
+}
+
+/**
  * AddMember.
  *
  * Receiver:

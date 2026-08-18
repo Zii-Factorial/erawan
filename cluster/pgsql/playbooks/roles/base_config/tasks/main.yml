@@ -51,6 +51,10 @@
     mode: "0600"
   tags: ["base_config"]
 
+# The three etcd tasks below (config, unit, enable) are the whole local-DCS
+# install. With the shared control plane they are skipped outright: the node
+# runs no etcd, so there is nothing to configure, start or keep in quorum —
+# see group_vars/all.yml.
 - name: Install etcd configuration
   ansible.builtin.template:
     src: etcd.conf.j2
@@ -58,6 +62,7 @@
     owner: root
     group: root
     mode: "0644"
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["base_config"]
 
 - name: Install etcd systemd unit
@@ -66,6 +71,7 @@
     dest: /etc/systemd/system/etcd.service
     mode: "0644"
   notify: reload systemd
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["base_config"]
 
 - name: Install Patroni systemd unit
@@ -86,9 +92,19 @@
   ansible.builtin.systemd:
     name: "{{ item }}"
     enabled: true
-  loop:
-    - etcd
-    - patroni
+  loop: "{{ ['etcd', 'patroni'] if not (erawan_dcs_control_plane | bool) else ['patroni'] }}"
+  tags: ["base_config"]
+
+# A node redeployed from local etcd onto the control plane would otherwise keep
+# a stale etcd starting at boot, still holding the old DCS state that Patroni
+# no longer reads.
+- name: Disable the local etcd service when the control plane owns the DCS
+  ansible.builtin.systemd:
+    name: etcd
+    state: stopped
+    enabled: false
+  failed_when: false
+  when: erawan_dcs_control_plane | bool
   tags: ["base_config"]
 
 - name: Apply etcd/Patroni/PostgreSQL peer firewall rules

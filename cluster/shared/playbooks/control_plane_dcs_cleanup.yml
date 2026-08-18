@@ -1,0 +1,19 @@
+---
+# Releases one tenant's namespace on the SHARED control-plane etcd: deletes its
+# keys, its user and its role, and revokes its nodes' access to the control
+# plane's client port.
+#
+# Runs against the control plane ONLY — the cluster's own nodes are usually
+# already destroyed by the time this is called, and nothing here needs them.
+#
+# Safe to run repeatedly and on a tenant that was never fully provisioned.
+
+- name: Release the tenant namespace on the shared control-plane DCS
+  hosts: control_plane
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: etcd_dcs_tenant
+      vars:
+        dcs_action: cleanup

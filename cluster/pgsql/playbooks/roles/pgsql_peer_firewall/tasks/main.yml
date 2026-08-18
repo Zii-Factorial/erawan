@@ -38,6 +38,10 @@
   failed_when: false
   tags: ["base_config", "pgsql_peer_firewall"]
 
+# Skipped with the shared control plane: no etcd listens on this node at all,
+# so an inbound allow would open ports nothing serves. The node's OUTBOUND
+# connection to the control plane's client port is governed by the control
+# plane's own firewall, which the shared provision playbook opens per node.
 - name: Allow etcd ports from cluster peers only
   community.general.ufw:
     rule: allow
@@ -46,7 +50,9 @@
     src: "{{ item.1 }}"
     comment: PostgreSQL cluster etcd peer traffic
   loop: "{{ [etcd_client_port, etcd_peer_port] | product(([primary_ip] + standby_ips) | unique) | list }}"
-  when: "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
+  when:
+    - not (erawan_dcs_control_plane | bool)
+    - "_ufw_status.rc == 0 and 'Status: active' in (_ufw_status.stdout | default(''))"
   tags: ["base_config", "pgsql_peer_firewall"]
 
 - name: Allow Patroni REST and PostgreSQL ports from proxy and cluster peers

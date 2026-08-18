@@ -12,6 +12,11 @@
 
 # ---------------------------------------------------------------------------
 # PLAY 2 — Remove etcd membership from the cluster (runs on primary)
+#           Skipped when the DCS lives on the shared control plane: the removed
+#           node was never an etcd member, so removal is purely a Patroni
+#           operation (its DCS member key expires on its own once Patroni is
+#           stopped in Play 1). The control plane's own firewall grant for the
+#           removed node is revoked by the Go runner's control_plane_dcs step.
 # ---------------------------------------------------------------------------
 - name: Remove etcd member from cluster
   hosts: pgsql_primary
@@ -19,7 +24,8 @@
   become: true
   any_errors_fatal: true
   roles:
-    - remove_member
+    - role: remove_member
+      when: not (erawan_dcs_control_plane | bool)
 
 # ---------------------------------------------------------------------------
 # PLAY 3 — Revoke the removed member's access on the remaining nodes. Without

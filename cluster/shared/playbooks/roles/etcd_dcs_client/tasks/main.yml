@@ -1,0 +1,67 @@
+---
+# Runs ON each cluster node that will talk to the shared control-plane etcd.
+# It installs the control plane's CA and proves the node can actually reach and
+# trust it — the node holds no client certificate and no root credential, only
+# the CA plus the per-tenant username/password written into its engine config.
+
+# On the add-member path this role is the first thing to touch a VM that may
+# have been created seconds ago, ahead of the engine's own preflight. Same
+# bounded manageability test used there; an immediate no-op on a ready node.
+- name: Wait for the node to become manageable
+  ansible.builtin.wait_for_connection:
+    timeout: "{{ dcs_client_connect_timeout_seconds }}"
+    sleep: 2
+
+- name: Ensure the DCS certificate directory exists
+  ansible.builtin.file:
+    path: "{{ dcs_client_ca_path | dirname }}"
+    state: directory
+    owner: "{{ dcs_client_ca_owner }}"
+    group: "{{ dcs_client_ca_group }}"
+    mode: "0755"
+
+- name: Install the control-plane CA certificate
+  ansible.builtin.copy:
+    content: "{{ dcs_ca_content }}"
+    dest: "{{ dcs_client_ca_path }}"
+    owner: "{{ dcs_client_ca_owner }}"
+    group: "{{ dcs_client_ca_group }}"
+    mode: "{{ dcs_client_ca_mode }}"
+
+- name: Verify the node can reach and trust the control-plane DCS
+  block:
+    - name: Wait for the control-plane client port from this node
+      ansible.builtin.wait_for:
+        host: "{{ dcs_endpoint_ip }}"
+        port: "{{ dcs_client_port }}"
+        state: started
+        timeout: 30
+
+    # -verify_ip is the check that matters: the engine verifies the control
+    # plane's certificate against the IP it dials, so a server certificate
+    # without that IP in its SANs produces a cluster that starts, fails every
+    # DCS call, and reports only a TLS error deep in the engine's journal.
+    # Catch it here, once, with the actual reason.
+    - name: Verify the control-plane server certificate against the installed CA
+      ansible.builtin.shell: |
+        set -euo pipefail
+        openssl s_client \
+          -connect {{ dcs_endpoint_ip }}:{{ dcs_client_port }} \
+          -CAfile {{ dcs_client_ca_path }} \
+          -verify_ip {{ dcs_endpoint_ip }} \
+          -verify_return_error </dev/null >/dev/null
+      args:
+        executable: /bin/bash
+      changed_when: false
+  rescue:
+    - name: Fail with the control-plane connectivity reason
+      ansible.builtin.fail:
+        msg: |
+          Node {{ ansible_host }} cannot use the shared control-plane DCS at
+          {{ dcs_endpoint_ip }}:{{ dcs_client_port }}:
+          {{ ansible_failed_result.msg | default('') }}
+          {{ ansible_failed_result.stderr | default('') | trim }}
+          Usual causes: the control plane's firewall does not allow this node
+          yet, etcd is not listening on {{ dcs_endpoint_ip }}, or its server
+          certificate does not carry {{ dcs_endpoint_ip }} in its SANs (the
+          engine verifies the certificate against the IP it dials).

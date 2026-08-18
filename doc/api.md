@@ -709,6 +709,32 @@ Remove a standby node from the Patroni cluster. Subject to the same one-at-a-tim
 
 ---
 
+### `DELETE /cluster/pgsql/dcs`
+
+Release the cluster's namespace on the **shared control-plane etcd**: its Patroni
+keys (`/db/patroni/<cluster>/`), its etcd user and role, and its nodes' access to
+the control plane's client port.
+
+Only for clusters deployed with `SHARED_CONTROL_PLANE`; a cluster that keeps its
+DCS on its own nodes is rejected. Runs against the control plane alone, so it
+works after the cluster's VMs are destroyed.
+
+Call it when decommissioning a cluster. Nothing else removes these objects, and
+they are named after the cluster — a later cluster of the same name would inherit
+them. PostgreSQL **data is untouched**, but a cluster whose nodes are still
+running loses its DCS and stops electing a leader, so release it after stopping
+or destroying the nodes. Rejected while another operation on the cluster is in
+flight.
+
+**Request:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `job_id` | string | yes | Source deploy job ID |
+
+Returns `202 Accepted` with a job whose single step is `release_control_plane_dcs`.
+
+---
+
 ### `POST /cluster/pgsql/metrics`
 
 Collect live metrics from a PostgreSQL cluster. Data is sourced from **Prometheus exporters** (`postgres_exporter` on `:9187` and `node_exporter` on `:9100`) running on each DB node, plus the **Patroni REST API** for cluster and failover categories — no database credentials are required.

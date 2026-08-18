@@ -20,6 +20,32 @@
 # etcd_client_port: 2379
 # etcd_peer_port: 2380
 
+# ---------------------------------------------------------------------------
+# DCS mode — where Patroni keeps its cluster state.
+#
+# Empty control_plane_ip (the default) is the classic layout: one etcd per DB
+# node, so the data plane itself has to carry an etcd quorum and a healthy
+# cluster needs an odd number of nodes.
+#
+# When the Go runner passes control_plane_ip (SHARED_CONTROL_PLANE), Patroni
+# instead uses the shared etcd on the control plane over TLS with a per-tenant
+# user, and NO etcd is installed, started or verified on the DB nodes at all —
+# which is what lets a 1- or 2-node PostgreSQL cluster be fully supported.
+# PostgreSQL has no quorum mechanism of its own, so the quorum has to live
+# somewhere; this moves it off the tenant's nodes onto infrastructure shared by
+# every tenant.
+#
+# Every etcd-related task in these playbooks is gated on erawan_dcs_control_plane.
+# ---------------------------------------------------------------------------
+control_plane_ip: ""
+control_plane_etcd_client_port: 2379
+control_plane_etcd_user: ""
+control_plane_etcd_password: ""
+# The control plane's CA, as installed on each node by the shared
+# control_plane_dcs_provision.yml playbook.
+patroni_etcd_ca_path: /etc/patroni/etcd-ca.pem
+erawan_dcs_control_plane: "{{ (control_plane_ip | default('') | trim) | length > 0 }}"
+
 # App database (optional)
 # new_user: ""
 # new_db: ""

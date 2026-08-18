@@ -1,9 +1,14 @@
 ---
+# ── Local etcd join (classic per-node etcd only) ────────────────────────────
+# With the shared control-plane DCS the new node runs no etcd: it was already
+# given the control plane's CA and the tenant credential by the deploy's
+# control_plane_dcs step, so joining is only the Patroni work further down.
 - name: Start etcd and join existing cluster as learner
   ansible.builtin.systemd:
     name: etcd
     enabled: true
     state: started
+  when: not (erawan_dcs_control_plane | bool)
 
 - name: Wait for local etcd to become healthy
   ansible.builtin.uri:
@@ -17,6 +22,7 @@
   retries: 150
   delay: 1
   changed_when: false
+  when: not (erawan_dcs_control_plane | bool)
 
 # Query the primary's etcd (which is always a voter) to find our own member ID.
 # This is needed to promote ourselves from learner to voting member.
@@ -40,6 +46,7 @@
     executable: /bin/bash
   register: _etcd_own_id
   changed_when: false
+  when: not (erawan_dcs_control_plane | bool)
 
 - name: Check if this member is still a learner
   ansible.builtin.shell: |
@@ -61,7 +68,9 @@
     executable: /bin/bash
   register: _etcd_is_learner
   changed_when: false
-  when: _etcd_own_id.stdout | trim != ''
+  when:
+    - not (erawan_dcs_control_plane | bool)
+    - (_etcd_own_id.stdout | default('')) | trim != ''
 
 # etcd refuses promotion until the learner has caught up to the leader's raft log.
 # Retry up to 3 min — etcd itself enforces the sync check so there is no data-loss risk.
@@ -81,8 +90,9 @@
   delay: 2
   changed_when: _etcd_promote.rc == 0
   when:
-    - _etcd_own_id.stdout | trim != ''
-    - _etcd_is_learner.stdout | trim == 'true'
+    - not (erawan_dcs_control_plane | bool)
+    - (_etcd_own_id.stdout | default('')) | trim != ''
+    - (_etcd_is_learner.stdout | default('')) | trim == 'true'
 
 # The register play's leader gate only proves Patroni's REST API (8008) is
 # up on the primary — NOT that PostgreSQL itself (5432) is reachable from

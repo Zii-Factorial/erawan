@@ -98,10 +98,40 @@
   failed_when: false
   tags: ["cluster_bootstrap"]
 
+# ── Shared control-plane DCS ────────────────────────────────────────────────
+# With the control plane owning the DCS this node runs no etcd, so every etcd
+# task below is skipped. What replaces them is one check: the CA must be on
+# disk, or Patroni cannot open a TLS connection to the control plane and would
+# fail here with a bare connection error a minute later. The CA is installed by
+# the shared control_plane_dcs_provision.yml playbook, which the Go runner runs
+# as the control_plane_dcs step of every deploy, start/recover and add-member —
+# so a missing file means that step did not run, not a transient fault.
+- name: Check the control-plane DCS CA is installed
+  ansible.builtin.stat:
+    path: "{{ patroni_etcd_ca_path }}"
+  register: _erawan_dcs_ca_stat
+  when: erawan_dcs_control_plane | bool
+  tags: ["cluster_bootstrap"]
+
+- name: Fail when the control-plane DCS CA is missing
+  ansible.builtin.fail:
+    msg: >-
+      This cluster uses the shared control-plane DCS
+      ({{ control_plane_ip }}:{{ control_plane_etcd_client_port }}) but
+      {{ patroni_etcd_ca_path }} does not exist on {{ ansible_host }}, so
+      Patroni cannot establish a TLS connection to it. Re-run the deploy or
+      start/recover for this cluster: its control_plane_dcs step installs the
+      CA and re-creates the tenant's etcd user.
+  when:
+    - erawan_dcs_control_plane | bool
+    - not (_erawan_dcs_ca_stat.stat.exists | default(false))
+  tags: ["cluster_bootstrap"]
+
 - name: Check whether etcd data reset already ran for this job
   ansible.builtin.stat:
     path: "{{ erawan_etcd_reset_marker }}"
   register: erawan_etcd_reset_marker_stat
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["cluster_bootstrap"]
 
 - name: Ensure etcd data directory is cleaned once per deployment job
@@ -112,7 +142,9 @@
     install -o root -g root -m 0600 /dev/null "{{ erawan_etcd_reset_marker }}"
   args:
     executable: /bin/bash
-  when: not erawan_etcd_reset_marker_stat.stat.exists
+  when:
+    - not (erawan_dcs_control_plane | bool)
+    - not erawan_etcd_reset_marker_stat.stat.exists
   tags: ["cluster_bootstrap"]
 
 # A full cluster stop/start (or a node that froze and got power-cycled) can
@@ -135,6 +167,7 @@
     executable: /bin/bash
   changed_when: false
   failed_when: false
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["cluster_bootstrap"]
 
 # A node's etcd.conf is rendered ONCE, at the moment it (or the file itself)
@@ -156,6 +189,7 @@
     regexp: '^initial-cluster:'
     line: >-
       initial-cluster: "{% for host_name in groups['all'] %}{{ 'etcd' ~ ((groups['all'] | list).index(host_name) + 1) }}=http://{{ hostvars[host_name].ansible_host }}:{{ etcd_peer_port }}{% if not loop.last %},{% endif %}{% endfor %}"
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["cluster_bootstrap"]
 
 # A data directory that is already initialized (member/ exists) ignores
@@ -169,6 +203,7 @@
   ansible.builtin.stat:
     path: /var/lib/etcd/member
   register: erawan_etcd_member_dir_stat
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["cluster_bootstrap"]
 
 - name: Skip stale initial-cluster-state validation on already-initialized nodes
@@ -176,7 +211,9 @@
     path: "{{ etcd_config_path }}"
     regexp: '^initial-cluster-state:'
     line: "initial-cluster-state: new"
-  when: erawan_etcd_member_dir_stat.stat.exists
+  when:
+    - not (erawan_dcs_control_plane | bool)
+    - erawan_etcd_member_dir_stat.stat.exists
   tags: ["cluster_bootstrap"]
 
 # block/rescue: this was the one bare systemd task in the role — when a
@@ -185,6 +222,7 @@
 # with the any_errors_fatal abort and left nothing to diagnose. Surface the
 # unit state and journal like every other startup step here does.
 - name: Start etcd on all nodes
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["cluster_bootstrap"]
   block:
     - name: Enable and start etcd service
@@ -222,6 +260,7 @@
 # (exit 1 in a restart-on-failure loop) reports its real error instead of a
 # bare timeout that requires manual SSH to diagnose.
 - name: Wait for etcd to accept connections and report healthy
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["cluster_bootstrap"]
   block:
     - name: Wait for local etcd client port

@@ -6,11 +6,26 @@ restapi:
   listen: {{ ansible_host }}:{{ patroni_rest_port }}
   connect_address: {{ ansible_host }}:{{ patroni_rest_port }}
 
+{% if erawan_dcs_control_plane | bool %}
+{# Shared control-plane DCS. etcd3 (not etcd) because the control plane runs
+   the v3 API with RBAC: the v2 endpoints this file uses in the classic layout
+   do not carry v3 auth, and the tenant's role/user/keys are all v3 objects.
+   The node holds only the CA and its own tenant credential — no client
+   certificate, no root access, and no reach outside <namespace>/<scope>/. #}
+etcd3:
+  hosts:
+    - {{ control_plane_ip }}:{{ control_plane_etcd_client_port }}
+  protocol: https
+  cacert: {{ patroni_etcd_ca_path }}
+  username: {{ control_plane_etcd_user }}
+  password: {{ control_plane_etcd_password | to_json }}
+{% else %}
 etcd:
   hosts:
 {% for host_name in groups['all'] %}
     - {{ hostvars[host_name].ansible_host }}:{{ etcd_client_port }}
 {% endfor %}
+{% endif %}
 
 bootstrap:
   dcs:

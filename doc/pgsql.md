@@ -45,7 +45,13 @@ DB Node VM
 | Single-node | 1 primary | No |
 | HA cluster | 1 primary + 1 or more standbys | Yes (automatic via Patroni) |
 
-For quorum, etcd needs an odd number of nodes. Use **3 or more** for production.
+With the default per-node etcd, quorum needs an odd number of nodes: use **3 or
+more** for production, and note that a 2-node cluster has no etcd quorum at all.
+
+That constraint disappears with the shared control plane
+(`SHARED_CONTROL_PLANE`): the DCS moves off the tenant's nodes, no etcd is
+installed on them, and any node count — 1 and 2 included — is fully supported.
+See [Shared control-plane DCS](#shared-control-plane-dcs) below.
 
 ---
 
@@ -263,6 +269,57 @@ HAProxy checks `GET http://<node>:8008/leader` on each backend. Patroni returns:
 - `503` — this node is a standby or not ready
 
 Only the leader receives client connections. After a failover, Patroni elects a new leader within seconds, and HAProxy reroutes automatically without any config change.
+
+---
+
+## Shared control-plane DCS
+
+PostgreSQL has no quorum mechanism of its own — Patroni borrows one from etcd.
+By default that etcd lives on the tenant's own database nodes (the box at the
+bottom of the diagram above), which is why production needs 3+ nodes and why a
+tenant losing one VM can cost it failover.
+
+Setting `SHARED_CONTROL_PLANE` to a control-plane host's private IP moves the DCS
+off the data plane. Clusters deployed from then on install **no etcd at all**:
+
+```
+  ┌─────────┐ ┌─────────┐            ┌────────────────────────────┐
+  │ Node 1  │ │ Node 2  │  https +   │  shared control-plane etcd │
+  │ Patroni ├─┤ Patroni ├──── auth ─▶│  /db/patroni/<cluster>/    │
+  └─────────┘ └─────────┘            │  user patroni-<cluster>-…  │
+       no local etcd                 └────────────────────────────┘
+```
+
+What each cluster is issued on the control plane:
+
+| Object | Value |
+|--------|-------|
+| Role | `patroni-<cluster>-role`, `readwrite` on `/db/patroni/<cluster>/` |
+| User | `patroni-<cluster>-user`, granted that role only |
+| Keys | `/db/patroni/<cluster>/…` — leader lock, config, members |
+
+etcd RBAC is prefix-based, so tenants cannot read or write each other's keys.
+Each node holds only the control plane's CA (`/etc/patroni/etcd-ca.pem`) and its
+own username/password — no client certificate, no root credential.
+
+**Lifecycle.** The tenant namespace is created by the `control_plane_dcs` step,
+which runs on every deploy, start/recover and add-member and is idempotent — it
+is also what re-installs the CA and re-opens the control plane's firewall for a
+node that a scale operation rebuilt with a new IP. Removing a member revokes that
+node's access. `DELETE /cluster/pgsql/dcs` releases the whole tenant (keys, user,
+role, firewall grants) when a cluster is decommissioned; nothing else does, and
+the objects are named after the cluster, so a later cluster of the same name
+would otherwise inherit them.
+
+**Prerequisites.** The control plane is expected to be already provisioned: etcd
+with TLS material under `/etc/etcd/ssl/`, a root user, and `auth enable`. Its
+server certificate must carry the control plane's IP in its SANs — Patroni
+verifies the certificate against the IP it dials, and the provisioning step fails
+loudly with that reason rather than letting the cluster start and then fail every
+DCS call. Erawan reaches it over SSH with the cluster's own key by default.
+
+**Existing clusters are never migrated.** Each job records the DCS layout it was
+deployed with, so turning the variable on or off cannot re-point a live cluster.
 
 ---
 

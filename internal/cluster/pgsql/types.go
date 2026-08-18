@@ -67,6 +67,12 @@ type StoredSpec struct {
 	PostgresVersion    int      `json:"postgres_version"`
 	ConnectionLimit    int      `json:"connection_limit"`
 	StepTimeoutSeconds int      `json:"step_timeout_seconds"`
+	// ControlPlaneDCS records where this cluster keeps its Patroni state: true
+	// means the shared control-plane etcd, false means one etcd per node. It is
+	// decided once, at deploy time, and every later operation on the cluster
+	// follows it — so turning SHARED_CONTROL_PLANE on or off in the environment
+	// never re-points an already-running cluster at a different DCS.
+	ControlPlaneDCS bool `json:"control_plane_dcs,omitempty"`
 }
 
 type SecretInput struct {
@@ -75,6 +81,9 @@ type SecretInput struct {
 	AdminPassword      string
 	NewUserPassword    string
 	ExporterPassword   string
+	// DCSPassword authenticates this cluster's per-tenant user on the shared
+	// control-plane etcd. Empty for clusters that run their own etcd.
+	DCSPassword string
 }
 
 type StoredSecret struct {
@@ -84,6 +93,8 @@ type StoredSecret struct {
 	ReplicatorPassword string `json:"replicator_password"`
 	AdminPassword      string `json:"admin_password"`
 	ExporterPassword   string `json:"exporter_password,omitempty"`
+	DCSUser            string `json:"dcs_user,omitempty"`
+	DCSPassword        string `json:"dcs_password,omitempty"`
 }
 
 type AddMemberRequest struct {

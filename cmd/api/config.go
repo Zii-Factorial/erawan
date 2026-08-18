@@ -44,6 +44,7 @@ type runtimeConfig struct {
 	server               config
 	haproxy              haproxyConfig
 	ssh                  sshConfig
+	controlPlane         core.ControlPlane
 	mysql                clusterEngineConfig
 	pgsql                clusterEngineConfig
 	encryptionKey        string
@@ -160,6 +161,7 @@ func loadConfig() runtimeConfig {
 		server:            loadServerConfig(),
 		haproxy:           loadHAProxyConfig(),
 		ssh:               loadSSHConfig(),
+		controlPlane:      loadControlPlaneConfig(baseDir),
 		mysql:             mysqlCfg,
 		pgsql:             pgsqlCfg,
 		encryptionKey:     env.GetString("ENCRYPTION_KEY", ""),
@@ -239,6 +241,59 @@ func loadSSHConfig() sshConfig {
 		privateKeyPath: env.GetString("CLUSTER_SSH_PRIVATE_KEY_PATH", ""),
 		verifyHostKeys: !insecure,
 		knownHostsFile: env.GetString("CLUSTER_SSH_KNOWN_HOSTS", ""),
+	}
+}
+
+/**
+ * loadControlPlaneConfig resolves the shared control plane that carries the DCS
+ * for engines without a quorum mechanism of their own (PostgreSQL/Patroni).
+ *
+ * SHARED_CONTROL_PLANE is the switch: unset (the default) keeps every engine on
+ * its classic per-node DCS, so this is opt-in and existing deployments are
+ * unaffected. The remaining keys only matter once it is set, and every one of
+ * them has a working default except the root password — which has none on
+ * purpose, so a half-configured control plane is caught at start-up rather than
+ * halfway through a deploy (see core.ControlPlane.Validate).
+ *
+ * Params:
+ *   baseDir string - project base directory the default playbook paths hang off.
+ * Returns:
+ *   core.ControlPlane - the resolved control plane; disabled when the IP is unset.
+ */
+func loadControlPlaneConfig(baseDir string) core.ControlPlane {
+	sharedPlaybookDir := filepath.Join(baseDir, "cluster", "shared", "playbooks")
+	return core.ControlPlane{
+		// SHARED_CONTROL_PLANE is the documented name; the two variants are
+		// accepted so an .env written against an earlier spelling keeps working.
+		IP: strings.TrimSpace(env.GetStringAny(
+			[]string{"SHARED_CONTROL_PLANE", "SHARED_CONTROL_PLAN", "SHAER_CONTROL_PLAN"}, "",
+		)),
+		EtcdClientPort: env.GetInt("CONTROL_PLANE_ETCD_CLIENT_PORT", 2379),
+		CACertPath:     env.GetString("CONTROL_PLANE_ETCD_CACERT", "/etc/etcd/ssl/ca.pem"),
+		CertPath:       env.GetString("CONTROL_PLANE_ETCD_CERT", "/etc/etcd/ssl/cp-etcd-01.pem"),
+		KeyPath:        env.GetString("CONTROL_PLANE_ETCD_KEY", "/etc/etcd/ssl/cp-etcd-01-key.pem"),
+		RootUser:       env.GetString("CONTROL_PLANE_ETCD_ROOT_USER", "root"),
+		RootPassword:   env.GetString("CONTROL_PLANE_ETCD_ROOT_PASSWORD", ""),
+		// Patroni's key path is namespace + scope, so a tenant's keys land in
+		// /db/patroni/<cluster>/ and its etcd role is granted exactly that.
+		Namespace:        env.GetString("CONTROL_PLANE_DCS_NAMESPACE", "/db/patroni/"),
+		TenantNamePrefix: env.GetString("CONTROL_PLANE_DCS_TENANT_PREFIX", "patroni"),
+		NodeCAPath:       env.GetString("CONTROL_PLANE_ETCD_NODE_CA_PATH", "/etc/patroni/etcd-ca.pem"),
+		NodeCAOwner:      env.GetString("CONTROL_PLANE_ETCD_NODE_CA_OWNER", "postgres"),
+		// The control plane is built from the same node template, so it is
+		// normally reached with the same credentials as the DB nodes; these
+		// override that per field when it is not.
+		SSHUser:           env.GetString("CONTROL_PLANE_SSH_USER", ""),
+		SSHPrivateKeyPath: env.GetString("CONTROL_PLANE_SSH_PRIVATE_KEY_PATH", ""),
+		SSHPort:           env.GetInt("CONTROL_PLANE_SSH_PORT", 0),
+		ProvisionPlaybook: env.GetString(
+			"CONTROL_PLANE_DCS_PROVISION_PLAYBOOK",
+			filepath.Join(sharedPlaybookDir, "control_plane_dcs_provision.yml"),
+		),
+		CleanupPlaybook: env.GetString(
+			"CONTROL_PLANE_DCS_CLEANUP_PLAYBOOK",
+			filepath.Join(sharedPlaybookDir, "control_plane_dcs_cleanup.yml"),
+		),
 	}
 }
 
@@ -343,8 +398,9 @@ func projectBaseDir() string {
 // scaling the host vertically (more CPU/RAM = more concurrent DB operations).
 //
 // Recommended starting points:
-//   DB_MAX_OPEN_CONNS  = (num_cpu * 2) + headroom, e.g. 25 for 8-core
-//   DB_MAX_IDLE_CONNS  = DB_MAX_OPEN_CONNS / 2
+//
+//	DB_MAX_OPEN_CONNS  = (num_cpu * 2) + headroom, e.g. 25 for 8-core
+//	DB_MAX_IDLE_CONNS  = DB_MAX_OPEN_CONNS / 2
 func loadDBPoolConfig() dbPoolConfig {
 	return dbPoolConfig{
 		maxOpenConns:    env.GetInt("DB_MAX_OPEN_CONNS", 25),

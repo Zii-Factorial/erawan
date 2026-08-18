@@ -28,6 +28,7 @@ type Runner struct {
 	maxOutputChars       int
 	sshPolicy            core.SSHPolicy
 	proxyAllowedIP       string
+	controlPlane         core.ControlPlane
 }
 
 /**
@@ -112,6 +113,107 @@ func (r *Runner) SetSSHPolicy(p core.SSHPolicy) { r.sshPolicy = p }
 func (r *Runner) SetProxyAllowedIP(ip string) { r.proxyAllowedIP = ip }
 
 /**
+ * SetControlPlane configures the shared control plane that carries the Patroni
+ * DCS. When it is enabled, clusters deployed from here keep no etcd of their
+ * own: Patroni talks to the control plane's etcd over TLS with a per-tenant
+ * user, which is what makes a one- or two-node PostgreSQL cluster viable.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Params:
+ *   cp core.ControlPlane - the resolved control-plane configuration
+ */
+func (r *Runner) SetControlPlane(cp core.ControlPlane) { r.controlPlane = cp }
+
+/**
+ * ControlPlaneEnabled reports whether new deploys should place their DCS on the
+ * shared control plane. Existing jobs are NOT re-evaluated against this: each
+ * cluster records the mode it was deployed with (StoredSpec.ControlPlaneDCS),
+ * so turning the environment variable on or off never re-points a running
+ * cluster at a different DCS.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Returns:
+ *   bool - true when a shared control plane is configured
+ */
+func (r *Runner) ControlPlaneEnabled() bool { return r.controlPlane.Enabled() }
+
+/**
+ * ControlPlaneTenantUser returns the etcd username a cluster is issued on the
+ * shared control plane, so the service can record it alongside the password in
+ * the job's stored secret.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Params:
+ *   clusterName string - the cluster (tenant) name
+ *
+ * Returns:
+ *   string - the resulting username, empty when no control plane is configured
+ */
+func (r *Runner) ControlPlaneTenantUser(clusterName string) string {
+	if !r.controlPlane.Enabled() {
+		return ""
+	}
+	return r.controlPlane.TenantUser(clusterName)
+}
+
+/**
+ * controlPlaneVars returns the node-facing DCS settings for one cluster, or an
+ * empty map when this cluster keeps its DCS on its own nodes. These are what
+ * patroni.yml.j2 renders into the etcd3 section, plus the switch every
+ * etcd-related task in the playbooks is gated on.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Params:
+ *   spec StoredSpec - the cluster spec, which records its DCS mode
+ *   dcsPassword string - the cluster's etcd password from its stored secret
+ *
+ * Returns:
+ *   map[string]any - extra vars to merge into an engine playbook run
+ */
+func (r *Runner) controlPlaneVars(spec StoredSpec, dcsPassword string) map[string]any {
+	if !r.usesControlPlane(spec) {
+		return nil
+	}
+	return map[string]any{
+		"control_plane_ip":               r.controlPlane.IP,
+		"control_plane_etcd_client_port": r.controlPlane.EtcdClientPort,
+		"control_plane_etcd_user":        r.controlPlane.TenantUser(spec.ClusterName),
+		"control_plane_etcd_password":    dcsPassword,
+		"patroni_etcd_ca_path":           r.controlPlane.NodeCAPath,
+		// Patroni's key path is namespace + scope, and the tenant's etcd role
+		// is granted exactly that prefix — so the namespace has to be the
+		// control plane's, not the per-node default.
+		"patroni_namespace": r.controlPlane.Namespace,
+	}
+}
+
+/**
+ * usesControlPlane reports whether a specific cluster's DCS lives on the shared
+ * control plane. Both conditions must hold: the process must have a control
+ * plane configured, and the cluster must have been deployed against one.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Params:
+ *   spec StoredSpec - the cluster spec
+ *
+ * Returns:
+ *   bool - true when this cluster's DCS is on the control plane
+ */
+func (r *Runner) usesControlPlane(spec StoredSpec) bool {
+	return spec.ControlPlaneDCS && r.controlPlane.Enabled()
+}
+
+/**
  * SetDebug.
  *
  * Receiver:
@@ -148,6 +250,21 @@ type memberRunConfig struct {
 	secret        SecretInput
 	memberIP      string
 	force         bool
+	timeout       time.Duration
+	resetHostKeys bool
+}
+
+// dcsRunConfig describes one run of a shared control-plane playbook. clientIPs
+// are the nodes that must be able to use the DCS (they receive the CA and are
+// granted the control plane's client port); revokeIPs are nodes that just left
+// and must lose that grant.
+type dcsRunConfig struct {
+	jobID         string
+	spec          StoredSpec
+	secret        SecretInput
+	clientIPs     []string
+	revokeIPs     []string
+	step          step
 	timeout       time.Duration
 	resetHostKeys bool
 }
@@ -232,6 +349,11 @@ func (r *Runner) RunStop(ctx context.Context, cfg runConfig) StepResult {
 		"primary_ip":        cfg.spec.PrimaryIP,
 		"standby_ips":       cfg.spec.StandbyIPs,
 	}
+	// Carried so the stop playbook can tell the two layouts apart: with the
+	// shared control plane there is no local etcd to stop, and the control
+	// plane's own etcd serves every other tenant — stopping this cluster must
+	// never reach it.
+	mergeVars(extraVars, r.controlPlaneVars(cfg.spec, cfg.secret.DCSPassword))
 	return core.AnsibleRun(ctx, core.AnsibleSpec{
 		Bin:             r.ansibleBin,
 		Playbook:        r.stopPlaybook,
@@ -243,6 +365,116 @@ func (r *Runner) RunStop(ctx context.Context, cfg runConfig) StepResult {
 		Timeout:         cfg.timeout,
 		StepName:        cfg.step.Name,
 		WorkspacePrefix: "pgsql-cluster-stop-",
+		Env:             r.sshPolicy.AnsibleEnv(),
+	})
+}
+
+/**
+ * RunDCSProvision creates (or converges) this cluster's tenant namespace on the
+ * shared control-plane etcd and installs the control plane's CA on the nodes in
+ * cfg.clientIPs. It is idempotent and runs on every deploy, start/recover and
+ * add-member, which is what heals a rebuilt node whose CA file is gone.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   cfg dcsRunConfig - the cfg (dcsRunConfig)
+ *
+ * Returns:
+ *   StepResult - the resulting StepResult
+ */
+func (r *Runner) RunDCSProvision(ctx context.Context, cfg dcsRunConfig) StepResult {
+	return r.runDCS(ctx, cfg, r.controlPlane.ProvisionPlaybook, "pgsql-dcs-provision-")
+}
+
+/**
+ * RunDCSCleanup releases this cluster's tenant namespace on the shared
+ * control-plane etcd: its keys, its user and its role. It runs against the
+ * control plane only, so it works after the cluster's own VMs are gone.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   cfg dcsRunConfig - the cfg (dcsRunConfig)
+ *
+ * Returns:
+ *   StepResult - the resulting StepResult
+ */
+func (r *Runner) RunDCSCleanup(ctx context.Context, cfg dcsRunConfig) StepResult {
+	return r.runDCS(ctx, cfg, r.controlPlane.CleanupPlaybook, "pgsql-dcs-cleanup-")
+}
+
+/**
+ * runDCS executes one of the shared control-plane playbooks. The inventory it
+ * builds is separate from the engine's own: it holds the control plane plus
+ * only the nodes this operation touches, so nothing in the engine playbooks
+ * (whose plays target `hosts: all`) can ever run against the control plane.
+ *
+ * Receiver:
+ *   r *Runner - pointer receiver; the method may mutate this Runner instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   cfg dcsRunConfig - the cfg (dcsRunConfig)
+ *   playbook string - the shared playbook to run
+ *   workspacePrefix string - temp workspace prefix for this run
+ *
+ * Returns:
+ *   StepResult - the resulting StepResult
+ */
+func (r *Runner) runDCS(ctx context.Context, cfg dcsRunConfig, playbook, workspacePrefix string) StepResult {
+	if !r.controlPlane.Enabled() {
+		return core.FailedStep(cfg.step.Name, fmt.Errorf("no shared control plane is configured (SHARED_CONTROL_PLANE)"))
+	}
+	if strings.TrimSpace(playbook) == "" {
+		return core.FailedStep(cfg.step.Name, fmt.Errorf("control-plane DCS playbook is not configured"))
+	}
+
+	cpSSHPort := cfg.spec.SSHPort
+	if r.controlPlane.SSHPort > 0 {
+		cpSSHPort = r.controlPlane.SSHPort
+	}
+	// The control plane's host key is pinned like any other node's, but never
+	// reset: unlike tenant VMs it is long-lived infrastructure, so a changed
+	// key there is a reason to stop, not something to trust on sight.
+	if err := r.sshPolicy.EnsureKnownHosts(ctx, []string{r.controlPlane.IP}, cpSSHPort, false); err != nil {
+		return core.FailedStep(cfg.step.Name, err)
+	}
+	if len(cfg.clientIPs) > 0 {
+		if err := r.sshPolicy.EnsureKnownHosts(ctx, cfg.clientIPs, cfg.spec.SSHPort, cfg.resetHostKeys); err != nil {
+			return core.FailedStep(cfg.step.Name, err)
+		}
+	}
+
+	target := core.ControlPlaneTarget{
+		ClientIPs:         cfg.clientIPs,
+		RevokeIPs:         cfg.revokeIPs,
+		Scope:             cfg.spec.ClusterName,
+		TenantPassword:    cfg.secret.DCSPassword,
+		SSHUser:           cfg.spec.SSHUser,
+		SSHPrivateKeyPath: cfg.spec.SSHPrivateKeyPath,
+		SSHPort:           cfg.spec.SSHPort,
+		SSHCommonArgs:     r.sshPolicy.SSHCommonArgs(),
+	}
+	extraVars := r.controlPlane.DCSVars(target)
+	extraVars["deployment_job_id"] = cfg.jobID
+	extraVars["cluster_name"] = cfg.spec.ClusterName
+
+	return core.AnsibleRun(ctx, core.AnsibleSpec{
+		Bin:             r.ansibleBin,
+		Playbook:        playbook,
+		Inventory:       r.controlPlane.InventoryYAML(target),
+		ExtraVars:       extraVars,
+		Verbosity:       r.ansibleVerbosity,
+		StreamLogs:      r.streamLogs,
+		MaxOutputChars:  r.maxOutputChars,
+		Timeout:         cfg.timeout,
+		StepName:        cfg.step.Name,
+		WorkspacePrefix: workspacePrefix,
 		Env:             r.sshPolicy.AnsibleEnv(),
 	})
 }
@@ -302,6 +534,7 @@ func (r *Runner) run(ctx context.Context, cfg runConfig) StepResult {
 		"step_timeout_seconds":        stepTimeout,
 		"proxy_allowed_ip":            r.proxyAllowedIP,
 	}
+	mergeVars(extraVars, r.controlPlaneVars(cfg.spec, cfg.secret.DCSPassword))
 	return core.AnsibleRun(ctx, core.AnsibleSpec{
 		Bin:             r.ansibleBin,
 		Playbook:        r.deployPlaybook,
@@ -398,14 +631,15 @@ func (r *Runner) runMember(ctx context.Context, cfg memberRunConfig, playbook, s
 		"step_timeout_seconds":        stepTimeout,
 		"proxy_allowed_ip":            r.proxyAllowedIP,
 	}
+	mergeVars(extraVars, r.controlPlaneVars(cfg.spec, cfg.secret.DCSPassword))
 	return core.AnsibleRun(ctx, core.AnsibleSpec{
-		Bin:             r.ansibleBin,
-		Playbook:        playbook,
-		Inventory:       inventory,
-		ExtraVars:       extraVars,
-		Verbosity:       r.ansibleVerbosity,
-		StreamLogs:      r.streamLogs,
-		MaxOutputChars:  r.maxOutputChars,
+		Bin:            r.ansibleBin,
+		Playbook:       playbook,
+		Inventory:      inventory,
+		ExtraVars:      extraVars,
+		Verbosity:      r.ansibleVerbosity,
+		StreamLogs:     r.streamLogs,
+		MaxOutputChars: r.maxOutputChars,
 		// cfg.timeout alone only covers one of this run's several sequential
 		// waits (see memberExecTimeout) -- the extra var above still carries
 		// the unmodified value so Ansible's own retry math is unaffected.
@@ -414,6 +648,20 @@ func (r *Runner) runMember(ctx context.Context, cfg memberRunConfig, playbook, s
 		WorkspacePrefix: "pgsql-member-job-",
 		Env:             r.sshPolicy.AnsibleEnv(),
 	})
+}
+
+/**
+ * mergeVars copies src into dst, overriding any key it already holds. Used to
+ * layer the control-plane DCS settings over an engine run's base extra vars.
+ *
+ * Params:
+ *   dst map[string]any - the extra vars being assembled
+ *   src map[string]any - the overrides; nil is a no-op
+ */
+func mergeVars(dst, src map[string]any) {
+	for k, v := range src {
+		dst[k] = v
+	}
 }
 
 /**

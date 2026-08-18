@@ -119,6 +119,9 @@ func (app *application) mount() *chi.Mux {
 		r.Post("/stop", pgsqlH.StopJob)
 		r.Post("/members", pgsqlH.AddMember)
 		r.Delete("/members", pgsqlH.RemoveMember)
+		// Releases the cluster's tenant namespace on the shared control-plane
+		// etcd. Only meaningful for clusters deployed with SHARED_CONTROL_PLANE.
+		r.Delete("/dcs", pgsqlH.ReleaseDCS)
 		r.Get("/connection-limit", pgsqlH.GetConnectionLimit)
 		r.Put("/connection-limit", pgsqlH.SetConnectionLimit)
 		r.Post("/users", pgsqlH.CreateUser)

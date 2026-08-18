@@ -26,9 +26,25 @@ type Service struct {
 	runAddMemberStep func(context.Context, memberRunConfig) StepResult
 	runRemMemberStep func(context.Context, memberRunConfig) StepResult
 	runStopStep      func(context.Context, runConfig) StepResult
+	runDCSProvision  func(context.Context, dcsRunConfig) StepResult
+	runDCSCleanup    func(context.Context, dcsRunConfig) StepResult
 }
 
 type step = core.Step
+
+// controlPlaneDCSStep provisions this cluster's tenant namespace on the shared
+// control-plane etcd and installs the control plane's CA on its nodes. Unlike
+// every other deploy step it does not run the deploy playbook: it runs the
+// shared, engine-agnostic playbook against a different inventory (the control
+// plane plus this cluster's nodes), so runDeploy dispatches it separately.
+// Skipped entirely for clusters that keep their DCS on their own nodes.
+const controlPlaneDCSStep = "control_plane_dcs"
+
+// dcsExecTimeout bounds a control-plane DCS run. Its work is a handful of
+// etcdctl calls plus one small file copy per node, so it never needs the full
+// step budget — but it does include a bounded wait for nodes that may have been
+// created seconds ago (add-member), hence minutes rather than seconds.
+const dcsExecTimeout = 10 * time.Minute
 
 // defaultMaxConcurrentJobs bounds concurrent background jobs until configured.
 const defaultMaxConcurrentJobs = 4
@@ -61,6 +77,8 @@ func execTimeoutForTag(tag string, base time.Duration) time.Duration {
 		return base
 	case "verify_cluster":
 		return base + verifyClusterExecBuffer
+	case controlPlaneDCSStep:
+		return dcsExecTimeout
 	default:
 		return base
 	}
@@ -118,6 +136,10 @@ func NewService(store Store, runner *Runner) *Service {
 		collector: NewCollector(),
 		steps: []step{
 			{Name: "preflight", Tag: "preflight"},
+			// Runs before base_config: the nodes must already trust the control
+			// plane and its tenant user must exist before any Patroni config
+			// referencing them is written.
+			{Name: controlPlaneDCSStep, Tag: controlPlaneDCSStep},
 			{Name: "base_config", Tag: "base_config"},
 			{Name: "primary_config", Tag: "primary_config"},
 			{Name: "standby_config", Tag: "standby_config"},
@@ -134,6 +156,8 @@ func NewService(store Store, runner *Runner) *Service {
 		svc.runAddMemberStep = runner.RunAddMember
 		svc.runRemMemberStep = runner.RunRemoveMember
 		svc.runStopStep = runner.RunStop
+		svc.runDCSProvision = runner.RunDCSProvision
+		svc.runDCSCleanup = runner.RunDCSCleanup
 	}
 	return svc
 }
@@ -226,6 +250,11 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*Job, error) {
 		return nil, err
 	}
 
+	// Decided once, here, and recorded on the job: every later operation on
+	// this cluster reads the spec, never the environment, so flipping
+	// SHARED_CONTROL_PLANE later cannot re-point a live cluster's DCS.
+	controlPlaneDCS := s.runner != nil && s.runner.ControlPlaneEnabled()
+
 	job := &Job{
 		ID:                newJobID(),
 		Status:            JobStatusRunning,
@@ -248,6 +277,7 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*Job, error) {
 			PostgresVersion:    req.PostgresVersion,
 			ConnectionLimit:    req.ConnectionLimit,
 			StepTimeoutSeconds: req.StepTimeoutSeconds,
+			ControlPlaneDCS:    controlPlaneDCS,
 		},
 		Steps: make([]StepResult, 0, len(s.steps)),
 	}
@@ -264,6 +294,16 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*Job, error) {
 		NewUserPassword:    req.NewUserPassword,
 		ExporterPassword:   stringOrGenerated(""),
 	}
+	// The tenant's etcd credential is generated once and never rotated by any
+	// later operation: recover and add-member rewrite the control plane's copy
+	// of it but do NOT rewrite patroni.yml on the existing nodes, so a rotation
+	// would leave running nodes authenticating with a password the control
+	// plane no longer accepts.
+	dcsUser := ""
+	if controlPlaneDCS {
+		secrets.DCSPassword = stringOrGenerated("")
+		dcsUser = s.runner.ControlPlaneTenantUser(req.ClusterName)
+	}
 	if err := s.store.SaveSecret(job.ID, StoredSecret{
 		PostgresUser:       defaultPostgresSuperuser,
 		PostgresPassword:   secrets.PostgresPassword,
@@ -271,6 +311,8 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*Job, error) {
 		ReplicatorPassword: secrets.ReplicatorPassword,
 		AdminPassword:      secrets.AdminPassword,
 		ExporterPassword:   secrets.ExporterPassword,
+		DCSUser:            dcsUser,
+		DCSPassword:        secrets.DCSPassword,
 	}); err != nil {
 		return nil, err
 	}
@@ -345,22 +387,29 @@ func (s *Service) Resume(ctx context.Context, jobID string, req ResumeRequest) (
 		return job, nil
 	}
 
-	if secret.PostgresPassword == "" || secret.ReplicatorPassword == "" || secret.AdminPassword == "" || secret.ExporterPassword == "" {
-		storedSecret, err := s.store.LoadSecret(job.ID)
-		if err == nil {
-			if secret.PostgresPassword == "" {
-				secret.PostgresPassword = storedSecret.PostgresPassword
-			}
-			if secret.ReplicatorPassword == "" {
-				secret.ReplicatorPassword = storedSecret.ReplicatorPassword
-			}
-			if secret.AdminPassword == "" {
-				secret.AdminPassword = storedSecret.AdminPassword
-			}
-			if secret.ExporterPassword == "" {
-				secret.ExporterPassword = storedSecret.ExporterPassword
-			}
+	// Loaded unconditionally now: besides filling in omitted passwords it also
+	// carries the control-plane DCS credential, which the caller never supplies
+	// and which must survive the SaveSecret below.
+	storedSecret, loadErr := s.store.LoadSecret(job.ID)
+	dcsUser := ""
+	if loadErr == nil {
+		if secret.PostgresPassword == "" {
+			secret.PostgresPassword = storedSecret.PostgresPassword
 		}
+		if secret.ReplicatorPassword == "" {
+			secret.ReplicatorPassword = storedSecret.ReplicatorPassword
+		}
+		if secret.AdminPassword == "" {
+			secret.AdminPassword = storedSecret.AdminPassword
+		}
+		if secret.ExporterPassword == "" {
+			secret.ExporterPassword = storedSecret.ExporterPassword
+		}
+		secret.DCSPassword = storedSecret.DCSPassword
+		dcsUser = storedSecret.DCSUser
+	}
+	if job.Request.ControlPlaneDCS && secret.DCSPassword == "" {
+		return nil, fmt.Errorf("job %s uses the shared control-plane DCS but its stored secret has no DCS password; deploy a new cluster instead of resuming", jobID)
 	}
 	if secret.PostgresPassword == "" {
 		secret.PostgresPassword = stringOrGenerated("")
@@ -381,6 +430,8 @@ func (s *Service) Resume(ctx context.Context, jobID string, req ResumeRequest) (
 		ReplicatorPassword: secret.ReplicatorPassword,
 		AdminPassword:      secret.AdminPassword,
 		ExporterPassword:   secret.ExporterPassword,
+		DCSUser:            dcsUser,
+		DCSPassword:        secret.DCSPassword,
 	}); err != nil {
 		return nil, err
 	}
@@ -439,9 +490,13 @@ func (s *Service) Recover(ctx context.Context, jobID string) (*Job, error) {
 		ReplicatorPassword: storedSecret.ReplicatorPassword,
 		AdminPassword:      storedSecret.AdminPassword,
 		ExporterPassword:   storedSecret.ExporterPassword,
+		DCSPassword:        storedSecret.DCSPassword,
+	}
+	if deployJob.Request.ControlPlaneDCS && secret.DCSPassword == "" {
+		return nil, fmt.Errorf("job %s uses the shared control-plane DCS but its stored secret has no DCS password; the cluster cannot be recovered without it", jobID)
 	}
 
-	recoverySteps := s.recoveryStepsFor()
+	recoverySteps := s.recoveryStepsFor(deployJob.Request)
 	recoveryJob := &Job{
 		ID:                newJobID(),
 		Status:            JobStatusRunning,
@@ -474,11 +529,21 @@ func (s *Service) Recover(ctx context.Context, jobID string) (*Job, error) {
 // recoveryStepsFor returns the ordered Ansible steps for PostgreSQL post-outage
 // recovery: cluster_bootstrap re-registers in DCS and starts Patroni; verify_cluster
 // confirms the cluster is healthy. Both are safe to re-run on existing data.
-func (s *Service) recoveryStepsFor() []step {
-	return []step{
-		{Name: "cluster_bootstrap", Tag: "cluster_bootstrap"},
-		{Name: "verify_cluster", Tag: "verify_cluster"},
+//
+// Clusters on the shared control plane re-provision their DCS tenant first.
+// That is not ceremony: start/recover is the operation that follows a scale
+// flow, which recreates node VMs from a stock image — the new node has no CA
+// for the control plane and the control plane has no firewall grant for its
+// address, both of which this step restores before Patroni is asked to start.
+func (s *Service) recoveryStepsFor(spec StoredSpec) []step {
+	steps := make([]step, 0, 3)
+	if spec.ControlPlaneDCS {
+		steps = append(steps, step{Name: controlPlaneDCSStep, Tag: controlPlaneDCSStep})
 	}
+	return append(steps,
+		step{Name: "cluster_bootstrap", Tag: "cluster_bootstrap"},
+		step{Name: "verify_cluster", Tag: "verify_cluster"},
+	)
 }
 
 /**
@@ -495,7 +560,7 @@ func (s *Service) recoveryStepsFor() []step {
  */
 func (s *Service) executeRecovery(ctx context.Context, recoveryJob *Job, deployJob *Job, secret SecretInput) {
 	timeout := time.Duration(deployJob.Request.StepTimeoutSeconds) * time.Second
-	recoverySteps := s.recoveryStepsFor()
+	recoverySteps := s.recoveryStepsFor(deployJob.Request)
 
 	for i, st := range recoverySteps {
 		recoveryJob.CurrentStep = st.Name
@@ -635,9 +700,15 @@ func (s *Service) executeStop(ctx context.Context, stopJob *Job, deployJob *Job)
 			Message:   "stop runner is not configured",
 		}
 	} else {
+		// Best-effort: the stop playbook needs no password, but it is told
+		// which DCS layout this cluster uses so it does not go looking for a
+		// local etcd that was never installed. A secret that fails to load is
+		// not worth failing a stop over.
+		storedSecret, _ := s.store.LoadSecret(deployJob.ID)
 		res = s.runStopStep(ctx, runConfig{
 			jobID:   deployJob.ID,
 			spec:    deployJob.Request,
+			secret:  SecretInput{DCSPassword: storedSecret.DCSPassword},
 			step:    st,
 			timeout: timeout,
 		})
@@ -912,6 +983,7 @@ func (s *Service) executeMemberAdd(ctx context.Context, memberJob *Job, deployJo
 		PostgresPassword:   storedSecret.PostgresPassword,
 		ReplicatorPassword: storedSecret.ReplicatorPassword,
 		AdminPassword:      storedSecret.AdminPassword,
+		DCSPassword:        storedSecret.DCSPassword,
 	}
 	timeout := time.Duration(deployJob.Request.StepTimeoutSeconds) * time.Second
 
@@ -926,6 +998,26 @@ func (s *Service) executeMemberAdd(ctx context.Context, memberJob *Job, deployJo
 		memberJob.CurrentStep = ip
 		s.updateJobProgress(memberJob)
 		_ = s.store.Save(memberJob)
+
+		// The new node must trust the control plane and be allowed through its
+		// firewall before Patroni starts there, and the tenant's etcd user has
+		// to exist (it may have been dropped out of band). Provisioning is
+		// idempotent, so this is also the repair path for the existing nodes.
+		if deployJob.Request.ControlPlaneDCS {
+			dcsResult := s.runDCSProvisionForMember(ctx, deployJob, secret, ip, resetHostKeys)
+			memberJob.Steps = append(memberJob.Steps, dcsResult)
+			if dcsResult.Status != JobStatusCompleted {
+				memberJob.Status = JobStatusFailed
+				memberJob.Error = dcsResult.Message
+				if memberJob.Error == "" {
+					memberJob.Error = fmt.Sprintf("control-plane DCS provisioning for %s failed", ip)
+				}
+				memberJob.CurrentStep = ""
+				s.updateJobProgress(memberJob)
+				_ = s.store.Save(memberJob)
+				return
+			}
+		}
 
 		result := s.doAddMember(ctx, memberRunConfig{
 			jobID:         deployJob.ID,
@@ -992,6 +1084,7 @@ func (s *Service) executeMemberRemove(ctx context.Context, memberJob *Job, deplo
 		PostgresPassword:   storedSecret.PostgresPassword,
 		ReplicatorPassword: storedSecret.ReplicatorPassword,
 		AdminPassword:      storedSecret.AdminPassword,
+		DCSPassword:        storedSecret.DCSPassword,
 	}
 	timeout := time.Duration(deployJob.Request.StepTimeoutSeconds) * time.Second
 	ip := memberJob.MemberOp.MemberIPs[0]
@@ -1021,6 +1114,16 @@ func (s *Service) executeMemberRemove(ctx context.Context, memberJob *Job, deplo
 		memberJob.Request.StandbyIPs = deployJob.Request.StandbyIPs
 		memberJob.Status = JobStatusCompleted
 		memberJob.Error = ""
+
+		// The removed node keeps its grant on the control plane's client port
+		// until this runs, and CloudStack recycles IPs — the same reason the
+		// remove_member playbook strips its pg_hba and UFW entries on the
+		// remaining nodes. Reported as a step but not fatal: the member is
+		// already out of the cluster, and the next operation converges it.
+		if deployJob.Request.ControlPlaneDCS {
+			dcsResult := s.runDCSRevokeForMember(ctx, deployJob, secret, ip)
+			memberJob.Steps = append(memberJob.Steps, dcsResult)
+		}
 	} else {
 		memberJob.Status = JobStatusFailed
 		memberJob.Error = result.Message
@@ -1031,6 +1134,87 @@ func (s *Service) executeMemberRemove(ctx context.Context, memberJob *Job, deplo
 	memberJob.CurrentStep = ""
 	s.updateJobProgress(memberJob)
 	_ = s.store.Save(memberJob)
+}
+
+/**
+ * runDCSProvisionForMember provisions the control-plane DCS ahead of an
+ * add-member run: the joining node gets the control plane's CA and a firewall
+ * grant, and the tenant's etcd user/role are converged.
+ *
+ * Receiver:
+ *   s *Service - pointer receiver; the method may mutate this Service instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   deployJob *Job - the deploy job supplying the cluster configuration
+ *   secret SecretInput - the cluster's secrets, including the DCS password
+ *   memberIP string - the node being added
+ *   resetHostKeys bool - forget any pinned host key for the new node first
+ *
+ * Returns:
+ *   StepResult - the resulting StepResult
+ */
+func (s *Service) runDCSProvisionForMember(ctx context.Context, deployJob *Job, secret SecretInput, memberIP string, resetHostKeys bool) StepResult {
+	st := step{Name: controlPlaneDCSStep}
+	if s.runDCSProvision == nil {
+		return StepResult{
+			Name:      st.Name,
+			Status:    JobStatusFailed,
+			StartedAt: time.Now().UTC(),
+			EndedAt:   time.Now().UTC(),
+			ExitCode:  -1,
+			Message:   "control-plane DCS runner is not configured",
+		}
+	}
+	return s.runDCSProvision(ctx, dcsRunConfig{
+		jobID:  deployJob.ID,
+		spec:   deployJob.Request,
+		secret: secret,
+		// Only the joining node: the existing nodes are serving traffic and
+		// already hold everything this installs.
+		clientIPs:     []string{memberIP},
+		step:          st,
+		timeout:       dcsExecTimeout,
+		resetHostKeys: resetHostKeys,
+	})
+}
+
+/**
+ * runDCSRevokeForMember drops a removed node's access to the control plane. It
+ * contacts the control plane only — the removed node is stopped by then.
+ *
+ * Receiver:
+ *   s *Service - pointer receiver; the method may mutate this Service instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   deployJob *Job - the deploy job supplying the cluster configuration
+ *   secret SecretInput - the cluster's secrets, including the DCS password
+ *   memberIP string - the node that was removed
+ *
+ * Returns:
+ *   StepResult - the resulting StepResult
+ */
+func (s *Service) runDCSRevokeForMember(ctx context.Context, deployJob *Job, secret SecretInput, memberIP string) StepResult {
+	st := step{Name: "control_plane_dcs_revoke"}
+	if s.runDCSProvision == nil {
+		return StepResult{
+			Name:      st.Name,
+			Status:    JobStatusFailed,
+			StartedAt: time.Now().UTC(),
+			EndedAt:   time.Now().UTC(),
+			ExitCode:  -1,
+			Message:   "control-plane DCS runner is not configured",
+		}
+	}
+	return s.runDCSProvision(ctx, dcsRunConfig{
+		jobID:     deployJob.ID,
+		spec:      deployJob.Request,
+		secret:    secret,
+		revokeIPs: []string{memberIP},
+		step:      st,
+		timeout:   dcsExecTimeout,
+	})
 }
 
 /**
@@ -1280,6 +1464,13 @@ func (s *Service) executeFrom(ctx context.Context, job *Job, startIndex int, sec
  *   StepResult - the resulting StepResult
  */
 func (s *Service) runDeploy(ctx context.Context, cfg runConfig) StepResult {
+	// The control-plane step is not a tag of the deploy playbook — it runs the
+	// shared DCS playbook against its own inventory. Dispatching here covers
+	// both callers (deploy/resume via executeFrom, start/recover via
+	// executeRecovery) in one place.
+	if cfg.step.Name == controlPlaneDCSStep {
+		return s.runDCSProvisionFor(ctx, cfg)
+	}
 	if s.runDeployStep == nil {
 		return StepResult{
 			Name:      cfg.step.Name,
@@ -1291,6 +1482,179 @@ func (s *Service) runDeploy(ctx context.Context, cfg runConfig) StepResult {
 		}
 	}
 	return s.runDeployStep(ctx, cfg)
+}
+
+/**
+ * runDCSProvisionFor runs the shared control-plane provisioning playbook for a
+ * deploy/recovery step, targeting every node of the cluster.
+ *
+ * Receiver:
+ *   s *Service - pointer receiver; the method may mutate this Service instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   cfg runConfig - the deploy step being executed
+ *
+ * Returns:
+ *   StepResult - the resulting StepResult
+ */
+func (s *Service) runDCSProvisionFor(ctx context.Context, cfg runConfig) StepResult {
+	if s.runDCSProvision == nil {
+		return StepResult{
+			Name:      cfg.step.Name,
+			Status:    JobStatusFailed,
+			StartedAt: time.Now().UTC(),
+			EndedAt:   time.Now().UTC(),
+			ExitCode:  -1,
+			Message:   "control-plane DCS runner is not configured",
+		}
+	}
+	return s.runDCSProvision(ctx, dcsRunConfig{
+		jobID:         cfg.jobID,
+		spec:          cfg.spec,
+		secret:        cfg.secret,
+		clientIPs:     append([]string{cfg.spec.PrimaryIP}, cfg.spec.StandbyIPs...),
+		step:          cfg.step,
+		timeout:       cfg.timeout,
+		resetHostKeys: cfg.resetHostKeys,
+	})
+}
+
+/**
+ * ReleaseDCS launches a job that releases this cluster's namespace on the
+ * shared control-plane etcd: its keys, its user, its role, and its nodes'
+ * access to the control plane's client port.
+ *
+ * Call it when a cluster is decommissioned. Nothing else does: the tenant's
+ * objects are named after the cluster, so leaving them behind both accumulates
+ * state on infrastructure every tenant shares and hands a later cluster of the
+ * same name someone else's leftover keys. It runs against the control plane
+ * only, so the cluster's own VMs may already be gone.
+ *
+ * The cluster's data is untouched — this removes coordination state, not
+ * PostgreSQL data — but a cluster whose nodes are still running WILL lose its
+ * DCS and stop electing a leader, so it is rejected while another operation on
+ * the cluster is in flight.
+ *
+ * Receiver:
+ *   s *Service - pointer receiver; the method may mutate this Service instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   jobID string - ID of the deploy job whose cluster should be released
+ *
+ * Returns:
+ *   *Job - the new running release job
+ *   error - error value; non-nil when the operation fails
+ */
+func (s *Service) ReleaseDCS(ctx context.Context, jobID string) (*Job, error) {
+	_ = ctx
+	deployJob, err := s.store.Load(jobID)
+	if err != nil {
+		return nil, fmt.Errorf("load job %q: %w", jobID, err)
+	}
+	if !deployJob.Request.ControlPlaneDCS {
+		return nil, fmt.Errorf("job %s keeps its DCS on its own nodes; there is nothing to release on the control plane", jobID)
+	}
+	if err := s.hydrateStoredSSHConfig(deployJob); err != nil {
+		return nil, err
+	}
+
+	releaseJobID := newJobID()
+	// Same claim as stop/add/remove-member: this mutates cluster-wide state, so
+	// it must not race another operation against the same cluster.
+	if err := s.claimMemberOpLock(jobID, releaseJobID); err != nil {
+		return nil, err
+	}
+
+	releaseJob := &Job{
+		ID:                releaseJobID,
+		Status:            JobStatusRunning,
+		CreatedAt:         time.Now().UTC(),
+		UpdatedAt:         time.Now().UTC(),
+		LastCompletedStep: -1,
+		Request:           deployJob.Request,
+		ServiceOp:         &core.ServiceOperation{Type: "release_dcs", SourceJobID: jobID},
+		Steps:             make([]StepResult, 0, 1),
+	}
+	s.updateJobProgress(releaseJob)
+	if err := s.store.Save(releaseJob); err != nil {
+		s.releaseMemberOpLock(jobID, releaseJobID)
+		return nil, err
+	}
+
+	bgReleaseJob, err := s.store.Load(releaseJob.ID)
+	if err != nil {
+		s.releaseMemberOpLock(jobID, releaseJobID)
+		return nil, err
+	}
+	bgDeployJob, err := s.store.Load(jobID)
+	if err != nil {
+		s.releaseMemberOpLock(jobID, releaseJobID)
+		return nil, err
+	}
+	s.start(func() {
+		defer s.releaseMemberOpLock(jobID, releaseJobID)
+		s.executeReleaseDCS(s.ctx, bgReleaseJob, bgDeployJob)
+	})
+	return releaseJob, nil
+}
+
+/**
+ * executeReleaseDCS runs the control-plane cleanup playbook as a single step.
+ *
+ * Receiver:
+ *   s *Service - pointer receiver; the method may mutate this Service instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   releaseJob *Job - the release job being tracked
+ *   deployJob *Job - the deploy job supplying the cluster configuration
+ */
+func (s *Service) executeReleaseDCS(ctx context.Context, releaseJob *Job, deployJob *Job) {
+	st := step{Name: "release_control_plane_dcs"}
+	releaseJob.CurrentStep = st.Name
+	s.updateJobProgress(releaseJob)
+	_ = s.store.Save(releaseJob)
+
+	var res StepResult
+	if s.runDCSCleanup == nil {
+		res = StepResult{
+			Name:      st.Name,
+			Status:    JobStatusFailed,
+			StartedAt: time.Now().UTC(),
+			EndedAt:   time.Now().UTC(),
+			ExitCode:  -1,
+			Message:   "control-plane DCS runner is not configured",
+		}
+	} else {
+		res = s.runDCSCleanup(ctx, dcsRunConfig{
+			jobID: deployJob.ID,
+			spec:  deployJob.Request,
+			// The cluster's nodes are not contacted: they are usually already
+			// destroyed. They are still listed so their grant on the control
+			// plane's client port goes away with the tenant.
+			revokeIPs: append([]string{deployJob.Request.PrimaryIP}, deployJob.Request.StandbyIPs...),
+			step:      st,
+			timeout:   dcsExecTimeout,
+		})
+	}
+	releaseJob.Steps = append(releaseJob.Steps, res)
+	releaseJob.CurrentStep = ""
+
+	if res.Status != JobStatusCompleted {
+		releaseJob.Status = JobStatusFailed
+		releaseJob.Error = res.Message
+		if releaseJob.Error == "" {
+			releaseJob.Error = "release control-plane DCS failed"
+		}
+	} else {
+		releaseJob.Status = JobStatusCompleted
+		releaseJob.LastCompletedStep = 0
+		releaseJob.Error = ""
+	}
+	s.updateJobProgress(releaseJob)
+	_ = s.store.Save(releaseJob)
 }
 
 /**
@@ -1360,7 +1724,7 @@ func (s *Service) updateJobProgress(job *Job) {
 		total = len(job.MemberOp.MemberIPs)
 	}
 	if job.RecoveryOp != nil {
-		total = len(s.recoveryStepsFor())
+		total = len(s.recoveryStepsFor(job.Request))
 	}
 	if job.ServiceOp != nil {
 		total = 1
@@ -1403,6 +1767,9 @@ func (s *Service) totalStepsFor(spec StoredSpec) int {
  *   bool - boolean result
  */
 func shouldSkipStep(st step, spec StoredSpec) (string, bool) {
+	if st.Name == controlPlaneDCSStep && !spec.ControlPlaneDCS {
+		return "cluster keeps its DCS on its own nodes", true
+	}
 	if st.Name == "standby_config" && len(spec.StandbyIPs) == 0 {
 		return "standby_ips is empty", true
 	}
