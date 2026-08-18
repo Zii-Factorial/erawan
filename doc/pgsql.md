@@ -297,7 +297,7 @@ What each cluster is issued on the control plane:
 | Role | `patroni-<cluster>-role`, `readwrite` on `/db/patroni/<cluster>/` |
 | User | `patroni-<cluster>-user`, granted that role only |
 | Keys | `/db/patroni/<cluster>/…` — leader lock, config, members |
-| Client cert | Signed by the control plane's CA, **with no CommonName** (see below) |
+| Client cert | `<engine>/<cluster>-user.pem` on the control plane, **no CommonName** (see below) |
 
 etcd RBAC is prefix-based, so tenants cannot read or write each other's keys.
 Each node holds the control plane's CA (`/etc/patroni/etcd-ca.pem`), its tenant
@@ -318,6 +318,32 @@ The certificate deliberately carries **no CommonName**, and that is not
 cosmetic — see [requirement 2](#2-tenant-client-certificates-must-carry-no-commonname)
 below. A pair minted before that rule is detected and re-issued automatically on
 the next `control_plane_dcs` run, so an affected cluster heals itself.
+
+Certificates are filed per engine on the control plane:
+
+```
+/etc/etcd/ssl/erawan-clients/
+  ca.srl                      one serial counter — X.509 serials are unique per CA
+  pgsql/
+    db-0001-user.pem
+    db-0001-user-key.pem
+```
+
+The engine directory is what keeps two engines apart. Without it, a PostgreSQL
+and a (say) Redis cluster both named `db-0001` mint to the same filename, and the
+one-time `creates:` guard silently hands the second engine the first one's
+credential. `core.ControlPlane.ForEngine` derives the directory; the pre-existing
+flat layout is migrated on the next provisioning run and removed on cleanup.
+
+Note what `ForEngine` deliberately does **not** scope: the etcd user
+(`patroni-<cluster>-user`) and the key namespace (`/db/patroni/<cluster>/`).
+Both are written into a node's `patroni.yml`, and only a full deploy rewrites
+that file — renaming them would leave running nodes authenticating as a user
+nothing converges any more, and would point the next redeploy at an empty
+keyspace it would then bootstrap over live data. A second engine must be given
+its own prefix and namespace explicitly via `CONTROL_PLANE_DCS_TENANT_PREFIX`
+and `CONTROL_PLANE_DCS_NAMESPACE`, which is a deployment decision, not a
+derivation.
 
 **Lifecycle.** The tenant namespace is created by the `control_plane_dcs` step,
 which runs on every deploy, start/recover and add-member and is idempotent — it

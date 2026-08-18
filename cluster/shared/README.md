@@ -29,7 +29,7 @@ certificate on the shared control plane:
 role  patroni-<cluster>-role   readwrite on /db/patroni/<cluster>/
 user  patroni-<cluster>-user   granted that role and nothing else
 keys  /db/patroni/<cluster>/…  Patroni's leader, config, members, …
-cert  subject /O=erawan (no CN) signed by the control plane CA
+cert  <engine>/<cluster>-user.pem, subject /O=erawan (no CN)
 ```
 
 etcd RBAC is prefix-based, which is what keeps tenants off each other's keys on
@@ -52,6 +52,21 @@ gateway, so a CN fails the whole cluster rather than one call. The tenant is
 identified by its RBAC username and password instead; prefix isolation is
 unaffected. A pair minted before this rule is detected by its subject and
 re-issued on the next provisioning run, so affected tenants heal themselves.
+
+Certificates are filed per engine — `dcs_client_cert_dir` is
+`/etc/etcd/ssl/erawan-clients/<engine>/`, derived by
+`core.ControlPlane.ForEngine`. That directory is what keeps engines apart: two
+engines each deploying a cluster named `db-0001` would otherwise mint to the
+same filename, and the one-time guard below would hand the second engine the
+first one's credential. The CA serial counter stays one level up, shared —
+X.509 serial numbers must be unique per CA, not per directory.
+
+`ForEngine` deliberately leaves the etcd user prefix and key namespace alone.
+Both are baked into every deployed cluster's engine config, which only a full
+deploy rewrites, so deriving them from the engine name would strand running
+nodes on a user nothing converges and re-point the next redeploy at an empty
+keyspace. A second engine gets its own via `dcs_namespace` /
+`dcs_tenant_user`, as a deployment decision.
 
 Minting is otherwise one-time per tenant (`creates:`), so the routine re-runs
 below never hand a live cluster a new credential; rotation means deleting the

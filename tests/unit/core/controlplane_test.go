@@ -201,3 +201,68 @@ func TestControlPlaneDCSVarsNeverEmitNullLists(t *testing.T) {
 		})
 	}
 }
+
+// ForEngine exists so two engines sharing one control plane cannot overwrite
+// each other's per-tenant certificates: without it, a PostgreSQL and a Redis
+// cluster both named db-001 mint to the same path, and the one-time `creates:`
+// guard hands the second engine the first one's credential.
+func TestControlPlaneForEngineScopesCertificateDirectory(t *testing.T) {
+	cp := enabledControlPlane()
+	cp.ClientCertDir = "/etc/etcd/ssl/erawan-clients"
+
+	pgsql := cp.ForEngine("pgsql")
+	redis := cp.ForEngine("redis")
+
+	if got, want := pgsql.ClientCertDir, "/etc/etcd/ssl/erawan-clients/pgsql"; got != want {
+		t.Errorf("pgsql cert dir = %q, want %q", got, want)
+	}
+	if got, want := redis.ClientCertDir, "/etc/etcd/ssl/erawan-clients/redis"; got != want {
+		t.Errorf("redis cert dir = %q, want %q", got, want)
+	}
+	if pgsql.ClientCertDir == redis.ClientCertDir {
+		t.Fatal("two engines resolved to the same certificate directory")
+	}
+	// Value receiver: scoping one engine must not mutate the shared config the
+	// next engine is derived from.
+	if got, want := cp.ClientCertDir, "/etc/etcd/ssl/erawan-clients"; got != want {
+		t.Errorf("receiver mutated: cert dir = %q, want %q", got, want)
+	}
+}
+
+// The tenant's etcd user and key namespace are written into every deployed
+// cluster's engine config, and only a full deploy rewrites that file. Deriving
+// them from the engine name would leave running nodes authenticating as a user
+// nothing converges any more, and would point the next redeploy at an empty
+// keyspace it would bootstrap over live data.
+func TestControlPlaneForEngineLeavesTenantNamingAlone(t *testing.T) {
+	cp := enabledControlPlane()
+	scoped := cp.ForEngine("pgsql")
+	scope := "db-0001"
+
+	if got, want := scoped.TenantUser(scope), cp.TenantUser(scope); got != want {
+		t.Errorf("tenant user = %q, want %q — renaming re-points live clusters", got, want)
+	}
+	if got, want := scoped.KeyPrefix(scope), cp.KeyPrefix(scope); got != want {
+		t.Errorf("key prefix = %q, want %q — remapping orphans live DCS state", got, want)
+	}
+}
+
+// An empty engine name (or an unset certificate directory) must be a no-op
+// rather than producing a path with a stray separator.
+func TestControlPlaneForEngineIgnoresEmptyInput(t *testing.T) {
+	cp := enabledControlPlane()
+	cp.ClientCertDir = "/etc/etcd/ssl/erawan-clients"
+
+	if got := cp.ForEngine("").ClientCertDir; got != cp.ClientCertDir {
+		t.Errorf("empty engine changed cert dir to %q", got)
+	}
+	if got := cp.ForEngine("   ").ClientCertDir; got != cp.ClientCertDir {
+		t.Errorf("blank engine changed cert dir to %q", got)
+	}
+
+	unset := enabledControlPlane()
+	unset.ClientCertDir = ""
+	if got := unset.ForEngine("pgsql").ClientCertDir; got != "" {
+		t.Errorf("unset cert dir became %q", got)
+	}
+}

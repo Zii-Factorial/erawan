@@ -121,15 +121,30 @@
     mode: "0700"
   when: dcs_client_cert_enabled | bool
 
-# A pair minted before the CN-less rule above makes every one of this tenant's
-# DCS requests fail, and the `creates:` guard below would keep it in place
-# forever. Removing it here is what lets the mint step re-issue it — and this
-# playbook runs on every deploy, start/recover and add-member, so an affected
-# tenant heals on its next operation with nothing to do by hand.
-- name: Retire a tenant client certificate that still carries a CommonName
+# Two kinds of superseded pair, both of which the `creates:` guard below would
+# otherwise preserve forever:
+#
+#   - one carrying a CommonName, which fails every DCS request this tenant makes
+#     (see the note above), and
+#   - one at the old flat path <parent>/<prefix>-<cluster>-user.pem, from before
+#     certificates were filed per engine.
+#
+# Clearing them here is what lets the mint step re-issue, and this playbook runs
+# on every deploy, start/recover and add-member — so an affected tenant heals on
+# its next operation with nothing to do by hand. Re-issuing is safe in a way that
+# rotating the tenant's PASSWORD is not: the nodes are handed the new pair by the
+# same run, and the path they load it from on the node never changes.
+- name: Retire superseded tenant client certificates
   ansible.builtin.shell: |
     set -euo pipefail
-    cert="{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem"
+    cert="{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}.pem"
+    legacy_dir="{{ dcs_client_cert_dir | dirname }}"
+
+    if [ -f "$legacy_dir/{{ dcs_tenant_user }}.pem" ]; then
+      rm -f "$legacy_dir/{{ dcs_tenant_user }}.pem" "$legacy_dir/{{ dcs_tenant_user }}-key.pem"
+      echo "retired-legacy-path {{ dcs_tenant_user }}"
+    fi
+
     if [ ! -f "$cert" ]; then
       exit 0
     fi
@@ -137,13 +152,13 @@
     # and never as a substring of some other value. The indent openssl uses for
     # those lines has changed between releases, hence the leading " *".
     if openssl x509 -in "$cert" -noout -subject -nameopt sep_multiline | grep -qE "^ *CN="; then
-      rm -f "$cert" "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}-key.pem"
-      echo "retired-cn-certificate {{ dcs_tenant_user }}"
+      rm -f "$cert" "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}-key.pem"
+      echo "retired-cn-certificate {{ dcs_client_cert_name }}"
     fi
   args:
     executable: /bin/bash
   register: _dcs_cert_retire
-  changed_when: "'retired-cn-certificate' in (_dcs_cert_retire.stdout | default(''))"
+  changed_when: "'retired-' in (_dcs_cert_retire.stdout | default(''))"
   when: dcs_client_cert_enabled | bool
 
 # `creates:` makes this a one-time mint per tenant: re-running provisioning
@@ -157,30 +172,30 @@
     cd "{{ dcs_client_cert_dir }}"
 
     openssl req -new -newkey rsa:2048 -nodes \
-      -keyout "{{ dcs_tenant_user }}-key.pem" \
-      -out "{{ dcs_tenant_user }}.csr" \
+      -keyout "{{ dcs_client_cert_name }}-key.pem" \
+      -out "{{ dcs_client_cert_name }}.csr" \
       -subj "/O=erawan"
 
     # clientAuth is not optional: the Go TLS stack inside etcd rejects a
     # client certificate that does not carry that extended key usage.
     # (No apostrophes in this block — the free-form shell argument splitter
     # reads one as an unterminated quote and fails the whole task.)
-    printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n' > "{{ dcs_tenant_user }}.ext"
+    printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n' > "{{ dcs_client_cert_name }}.ext"
 
     openssl x509 -req -sha256 \
-      -in "{{ dcs_tenant_user }}.csr" \
+      -in "{{ dcs_client_cert_name }}.csr" \
       -CA "{{ dcs_ca_file }}" -CAkey "{{ dcs_ca_key_file }}" \
-      -CAcreateserial -CAserial "{{ dcs_client_cert_dir }}/ca.srl" \
-      -extfile "{{ dcs_tenant_user }}.ext" \
+      -CAcreateserial -CAserial "{{ dcs_client_cert_serial }}" \
+      -extfile "{{ dcs_client_cert_name }}.ext" \
       -days {{ dcs_client_cert_days }} \
-      -out "{{ dcs_tenant_user }}.pem"
+      -out "{{ dcs_client_cert_name }}.pem"
 
-    rm -f "{{ dcs_tenant_user }}.csr" "{{ dcs_tenant_user }}.ext"
-    chmod 0600 "{{ dcs_tenant_user }}-key.pem" "{{ dcs_tenant_user }}.pem"
-    echo "client-cert-created {{ dcs_tenant_user }}"
+    rm -f "{{ dcs_client_cert_name }}.csr" "{{ dcs_client_cert_name }}.ext"
+    chmod 0600 "{{ dcs_client_cert_name }}-key.pem" "{{ dcs_client_cert_name }}.pem"
+    echo "client-cert-created {{ dcs_client_cert_name }}"
   args:
     executable: /bin/bash
-    creates: "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem"
+    creates: "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}.pem"
   when: dcs_client_cert_enabled | bool
 
 # Published for the client play, which installs these on the cluster nodes: the
@@ -197,8 +212,8 @@
   ansible.builtin.slurp:
     src: "{{ dcs_client_cert_dir }}/{{ item }}"
   loop:
-    - "{{ dcs_tenant_user }}.pem"
-    - "{{ dcs_tenant_user }}-key.pem"
+    - "{{ dcs_client_cert_name }}.pem"
+    - "{{ dcs_client_cert_name }}-key.pem"
   register: _dcs_client_pair
   no_log: true
   when: dcs_client_cert_enabled | bool

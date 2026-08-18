@@ -60,7 +60,7 @@ func buildApplication(ctx context.Context, cfg runtimeConfig) (*application, err
 		return nil, err
 	}
 
-	pgsqlStore, pgsqlSvc, err := buildPGSQLCluster(ctx, cfg.pgsql, cfg.ssh, cfg.controlPlane, cfg.server.proxyHost, cfg.maxConcurrentJobs, jobDB)
+	pgsqlStore, pgsqlSvc, err := buildPGSQLCluster(ctx, cfg.pgsql, cfg.ssh, cfg.controlPlane.ForEngine("pgsql"), cfg.server.proxyHost, cfg.maxConcurrentJobs, jobDB)
 	if err != nil {
 		if jobDB != nil {
 			_ = jobDB.Close()

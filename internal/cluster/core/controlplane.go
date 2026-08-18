@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"net"
+	"path"
 	"strconv"
 	"strings"
 )
@@ -117,6 +118,40 @@ type ControlPlaneTarget struct {
  *   bool - true when a control-plane address is set
  */
 func (c ControlPlane) Enabled() bool { return strings.TrimSpace(c.IP) != "" }
+
+/**
+ * ForEngine returns a copy of the control plane scoped to one database engine,
+ * so engines sharing a control plane cannot overwrite each other's per-tenant
+ * certificates. Two engines that each deploy a cluster called "db-001" would
+ * otherwise mint to the same file, and the one-time `creates:` guard would hand
+ * the second engine the first one's credential.
+ *
+ * Only the certificate directory is scoped. The etcd user prefix and key
+ * namespace are deliberately NOT derived from the engine name: both are written
+ * into every deployed cluster's engine config, and deploy is the only flow that
+ * rewrites it — so changing them would leave running nodes authenticating as a
+ * user nobody converges any more, and would re-point the next redeploy at an
+ * empty keyspace it would then bootstrap over live data. Existing clusters are
+ * never migrated. A second engine must therefore be given its own prefix and
+ * namespace explicitly; this method makes the certificate store safe on its own.
+ *
+ * Receiver:
+ *   c ControlPlane - value receiver; the method operates on a copy
+ *
+ * Params:
+ *   engine string - the engine name (e.g. "pgsql"), used as a directory name
+ *
+ * Returns:
+ *   ControlPlane - the scoped copy; the receiver is unchanged
+ */
+func (c ControlPlane) ForEngine(engine string) ControlPlane {
+	engine = strings.TrimSpace(engine)
+	if engine == "" || strings.TrimSpace(c.ClientCertDir) == "" {
+		return c
+	}
+	c.ClientCertDir = path.Join(c.ClientCertDir, engine)
+	return c
+}
 
 /**
  * Validate checks that an enabled control plane is fully configured. It is

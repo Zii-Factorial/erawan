@@ -59,16 +59,22 @@
     msg: "{{ (_dcs_cleanup.stdout | default('')).splitlines() }}"
 
 # The tenant's client certificate goes with the tenant. Left behind it would
-# stay valid until its expiry and — because etcd derives a username from the
-# CN — would authorize as this tenant again the moment a cluster of the same
-# name is created.
+# stay valid until its expiry, and a cluster later created under the same name
+# would inherit it from the mint step's one-time `creates:` guard rather than
+# being issued its own.
+#
+# The parent-directory entries are the pre-per-engine layout; a decommission
+# that runs against a cluster deployed before that change has to clear both, or
+# the stale pair outlives the tenant it belonged to.
 - name: Remove the tenant client certificate from the control plane
   ansible.builtin.file:
-    path: "{{ dcs_client_cert_dir }}/{{ item }}"
+    path: "{{ item }}"
     state: absent
   loop:
-    - "{{ dcs_tenant_user }}.pem"
-    - "{{ dcs_tenant_user }}-key.pem"
+    - "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}.pem"
+    - "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}-key.pem"
+    - "{{ dcs_client_cert_dir | dirname }}/{{ dcs_tenant_user }}.pem"
+    - "{{ dcs_client_cert_dir | dirname }}/{{ dcs_tenant_user }}-key.pem"
 
 - name: Check UFW availability and status on the control plane
   ansible.builtin.command:

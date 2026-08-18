@@ -29,8 +29,18 @@ dcs_ca_key_file: /etc/etcd/ssl/ca-key.pem
 # Minted certificates live here, one pair per tenant, so they can be inspected,
 # rotated or revoked out of band. Kept off the CA's own directory so the CA
 # serial file this writes never lands next to the CA key.
+# The Go runner appends the engine name (see core.ControlPlane.ForEngine), so
+# this is the per-engine directory: /etc/etcd/ssl/erawan-clients/<engine>/.
 dcs_client_cert_dir: /etc/etcd/ssl/erawan-clients
 dcs_client_cert_days: 3650
+# Certificates are named after the cluster, not after the etcd user: the engine
+# directory above already disambiguates, so repeating the engine in the filename
+# would only make it longer.
+dcs_client_cert_name: "{{ dcs_scope }}-user"
+# X.509 serial numbers must be unique per CA, not per directory — one serial
+# file per engine would let two engines mint different certificates carrying the
+# same serial from the same CA. Kept one level up, where every engine shares it.
+dcs_client_cert_serial: "{{ dcs_client_cert_dir | dirname }}/ca.srl"
 
 # The etcd superuser that owns RBAC on the shared control plane. Its password
 # comes from the erawan host's CONTROL_PLANE_ETCD_ROOT_PASSWORD.
