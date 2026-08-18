@@ -744,7 +744,41 @@ Only for clusters deployed with `SHARED_CONTROL_PLANE`; a cluster that keeps its
 DCS on its own nodes is rejected. Runs against the control plane alone, so it
 works after the cluster's VMs are destroyed.
 
-Call it when decommissioning a cluster. Nothing else removes these objects, and
+Call it when decommissioning a cluster. `DELETE /haproxy/config` does this for
+you when given a `job_id`; this endpoint is how you clear clusters deleted before
+that existed, or retry a release that failed.
+
+**Request** — one cluster:
+```json
+{ "job_id": "8c84969fef4794ea8bd1fc1c" }
+```
+
+**Request** — several at once, for clearing a backlog:
+```json
+{ "job_ids": ["8c84969f…", "a1b2c3d4…"], "confirm": true }
+```
+
+`confirm` is required for the batch form only, so single releases are unchanged.
+A batch reports each cluster separately and never fails as a whole — releasing
+four and failing on the fifth must not look like nothing happened:
+
+```json
+{ "released": 1, "requested": 2, "results": [
+    { "job_id": "8c84969f…", "status": "releasing", "release_job_id": "…" },
+    { "job_id": "a1b2c3d4…", "status": "failed", "error": "load job: not found" } ] }
+```
+
+There is deliberately **no "release everything unused" mode.** Nothing in this
+system records that a cluster was deleted, so a stopped cluster and a
+decommissioned one are indistinguishable — and purging a stopped cluster's keys
+strips the Patroni state it expects on its next start. Every release names its
+clusters explicitly.
+
+Every leaked tenant still has its deploy job, since jobs are never pruned: find
+the IDs with `GET /cluster/pgsql/jobs?limit=50` and match on
+`request.cluster_name`.
+
+Nothing else removes these objects, and
 they are named after the cluster — a later cluster of the same name would inherit
 them. PostgreSQL **data is untouched**, but a cluster whose nodes are still
 running loses its DCS and stops electing a leader, so release it after stopping

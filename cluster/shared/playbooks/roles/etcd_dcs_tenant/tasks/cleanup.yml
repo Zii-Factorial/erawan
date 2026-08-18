@@ -71,8 +71,17 @@
     path: "{{ item }}"
     state: absent
   loop:
+    # Current scheme: per-engine directory, named after the cluster.
     - "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}.pem"
     - "{{ dcs_client_cert_dir }}/{{ dcs_client_cert_name }}-key.pem"
+    # Per-engine directory but named after the etcd user — what a control plane
+    # provisioned between the two changes holds. Listed explicitly rather than
+    # matched by glob: a glob on the cluster name would also catch a different
+    # cluster whose name contains this one (db-2 inside db-20), and deleting a
+    # live cluster's certificate is far worse than leaving a dead one behind.
+    - "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem"
+    - "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}-key.pem"
+    # Flat layout, from before certificates were filed per engine.
     - "{{ dcs_client_cert_dir | dirname }}/{{ dcs_tenant_user }}.pem"
     - "{{ dcs_client_cert_dir | dirname }}/{{ dcs_tenant_user }}-key.pem"
 

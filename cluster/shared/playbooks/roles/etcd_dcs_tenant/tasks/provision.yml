@@ -145,6 +145,16 @@
       echo "retired-legacy-path {{ dcs_tenant_user }}"
     fi
 
+    # Same tenant, per-engine directory, but named after the etcd user — what a
+    # control plane provisioned between the directory change and the rename
+    # holds. Left in place it is a valid credential for a cluster that may be
+    # long gone, and no cleanup would ever name it.
+    if [ -f "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem" ]; then
+      rm -f "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem" \
+            "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}-key.pem"
+      echo "retired-superseded-name {{ dcs_tenant_user }}"
+    fi
+
     if [ ! -f "$cert" ]; then
       exit 0
     fi

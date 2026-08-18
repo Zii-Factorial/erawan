@@ -2,6 +2,7 @@ package pgsql
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -184,6 +185,62 @@ func (h *Handler) RecoverJob(w http.ResponseWriter, r *http.Request) {
 	render.Accepted(w, "PostgreSQL cluster recovery started", job)
 }
 
+// releaseDCSRequest is the body of the control-plane DCS release. It accepts a
+// single job_id, or job_ids for releasing several clusters in one call —
+// useful for clearing tenants left behind by deletes that predate the proxy
+// delete releasing them.
+//
+// Both forms name their clusters explicitly. There is deliberately no "release
+// everything unused" mode: nothing in this system records that a cluster was
+// deleted, so a stopped cluster and a decommissioned one are indistinguishable,
+// and purging a stopped cluster's keys would strip the Patroni state it expects
+// to find on its next start.
+type releaseDCSRequest struct {
+	JobID  string   `json:"job_id"`
+	JobIDs []string `json:"job_ids"`
+	// Confirm is required for the batch form only, so a single release keeps
+	// working exactly as before.
+	Confirm bool `json:"confirm"`
+}
+
+/**
+ * jobIDs normalizes the two accepted body shapes into one de-duplicated list.
+ *
+ * Receiver:
+ *   req releaseDCSRequest - value receiver; the method operates on a copy
+ *
+ * Returns:
+ *   []string - the job IDs to release, in the order given
+ *   error - non-nil when the body names no job, or a batch is unconfirmed
+ */
+func (req releaseDCSRequest) jobIDs() ([]string, error) {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(req.JobIDs)+1)
+	for _, id := range append([]string{req.JobID}, req.JobIDs...) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("job_id or job_ids is required")
+	}
+	if len(out) > 1 && !req.Confirm {
+		return nil, errors.New(`releasing several clusters at once requires "confirm": true`)
+	}
+	return out, nil
+}
+
+// releaseDCSResult is one cluster's outcome in a batch release.
+type releaseDCSResult struct {
+	JobID        string `json:"job_id"`
+	Status       string `json:"status"`
+	ReleaseJobID string `json:"release_job_id,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
 // serviceOpRequest is the body of the stop/start cluster endpoints: the deploy
 // job that owns the cluster, passed as payload like the member endpoints.
 type serviceOpRequest struct {
@@ -275,17 +332,50 @@ func (h *Handler) StopJob(w http.ResponseWriter, r *http.Request) {
  *   r *http.Request - the incoming HTTP request
  */
 func (h *Handler) ReleaseDCS(w http.ResponseWriter, r *http.Request) {
-	jobID, err := decodeServiceOpRequest(r)
+	var req releaseDCSRequest
+	if err := render.DecodeJSON(r, &req); err != nil {
+		render.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	jobIDs, err := req.jobIDs()
 	if err != nil {
 		render.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	job, err := h.cluster.ReleaseDCS(r.Context(), jobID)
-	if err != nil {
-		render.Error(w, http.StatusBadRequest, err.Error())
+
+	// One job keeps the original response verbatim, so existing callers are
+	// unaffected by the batch form.
+	if len(jobIDs) == 1 {
+		job, err := h.cluster.ReleaseDCS(r.Context(), jobIDs[0])
+		if err != nil {
+			render.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		render.Accepted(w, "PostgreSQL control-plane DCS release initiated", job)
 		return
 	}
-	render.Accepted(w, "PostgreSQL control-plane DCS release initiated", job)
+
+	// A batch never fails as a whole: releasing four tenants and failing on the
+	// fifth must not look like nothing happened, or the caller retries the four
+	// that already succeeded and cannot tell which one actually needs attention.
+	results := make([]releaseDCSResult, 0, len(jobIDs))
+	var released int
+	for _, jobID := range jobIDs {
+		job, err := h.cluster.ReleaseDCS(r.Context(), jobID)
+		switch {
+		case err != nil:
+			results = append(results, releaseDCSResult{JobID: jobID, Status: "failed", Error: err.Error()})
+		default:
+			released++
+			res := releaseDCSResult{JobID: jobID, Status: "releasing"}
+			if job != nil {
+				res.ReleaseJobID = job.ID
+			}
+			results = append(results, res)
+		}
+	}
+	render.Accepted(w, fmt.Sprintf("PostgreSQL control-plane DCS release initiated for %d of %d clusters", released, len(jobIDs)),
+		map[string]any{"released": released, "requested": len(jobIDs), "results": results})
 }
 
 /**
