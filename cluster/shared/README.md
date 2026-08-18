@@ -29,7 +29,7 @@ certificate on the shared control plane:
 role  patroni-<cluster>-role   readwrite on /db/patroni/<cluster>/
 user  patroni-<cluster>-user   granted that role and nothing else
 keys  /db/patroni/<cluster>/…  Patroni's leader, config, members, …
-cert  CN=patroni-<cluster>-user signed by the control plane CA
+cert  subject /O=erawan (no CN) signed by the control plane CA
 ```
 
 etcd RBAC is prefix-based, which is what keeps tenants off each other's keys on
@@ -40,11 +40,22 @@ credential, never another tenant's material, and no reach outside their prefix.
 The client certificate exists because a control plane running
 `client-cert-auth: true` aborts the TLS handshake for a client that presents
 none, long before any username/password is exchanged. Each tenant gets its own
-so it can be revoked independently, and the CN is the tenant's etcd user —
-which also lines up with etcd deriving a username from the certificate when a
-request carries no auth token. Minting is one-time per tenant (`creates:`), so
-the routine re-runs below never hand a live cluster a new credential; rotation
-means deleting the pair under `dcs_client_cert_dir` and re-running. Set
+so it can be revoked independently.
+
+It carries **no CommonName**, which is load-bearing rather than an omission.
+With `client-cert-auth`, the gRPC JSON gateway and RBAC auth all enabled, etcd
+rejects every `/v3` request whose client certificate has a CN — `HTTP 400
+CommonName of client sending a request against gateway will be ignored and not
+used as expected`, from the guard in etcd's `embed/serve.go`. CN-derived
+identity cannot cross the gateway, and Patroni reaches the DCS only over that
+gateway, so a CN fails the whole cluster rather than one call. The tenant is
+identified by its RBAC username and password instead; prefix isolation is
+unaffected. A pair minted before this rule is detected by its subject and
+re-issued on the next provisioning run, so affected tenants heal themselves.
+
+Minting is otherwise one-time per tenant (`creates:`), so the routine re-runs
+below never hand a live cluster a new credential; rotation means deleting the
+pair under `dcs_client_cert_dir` and re-running. Set
 `dcs_client_cert_enabled: false` for a control plane that does not require them
 — it is also the only setting that needs the CA private key on the control
 plane.
@@ -69,11 +80,15 @@ infrastructure and a later cluster of the same name would inherit them.
 
 - `etcd_dcs_tenant` — all control-plane-side work. `dcs_action` selects
   `provision` or `cleanup`.
-- `etcd_dcs_client` — the node-side half: installs the CA and proves the node can
-  reach the control plane and validate its certificate **against the IP it
-  dials**. That last check is deliberate: a server certificate without that IP in
-  its SANs produces a cluster that starts and then fails every DCS call with a
-  TLS error buried in the engine's journal.
+- `etcd_dcs_client` — the node-side half: installs the CA and the tenant
+  certificate, then proves the node can actually use the control plane. Two
+  probes, both deliberate. `GET /version` validates the server certificate
+  **against the IP the node dials** — without that IP in its SANs a cluster
+  starts and then fails every DCS call with a TLS error buried in the engine's
+  journal. `POST /v3/auth/authenticate`, with the tenant's own certificate and
+  credential, then covers everything `/version` cannot see: the gateway being
+  off, a CN on the certificate, a server certificate missing `clientAuth`, RBAC
+  being disabled, and a credential the control plane no longer accepts.
 
 ## What is assumed, and what is not
 
@@ -81,6 +96,27 @@ The control plane itself — its etcd, TLS material, root user and `auth enable`
 is expected to exist already. Erawan consumes it and never provisions it, which
 is why the roles fail early and by name when `/etc/etcd/ssl/*.pem` is missing or
 the root credential is wrong.
+
+Four settings on that host are load-bearing, and none of them is visible to a
+`GET /version` check — which is served by etcd's own HTTP handler and answers
+even when the API the engines use is entirely unavailable:
+
+1. **`enable-grpc-gateway: true`.** Engines reach etcd v3 over HTTP, not gRPC.
+   etcd defaults this to `true` for command-line flags but **`false`** when
+   started with `--config-file`, so a config-file host that omits the key serves
+   no `/v3` at all — while `etcdctl` and `/version` keep working, which is what
+   makes it so easy to miss.
+2. **Tenant certificates with no CommonName** — see above.
+3. **A server certificate carrying both `serverAuth` and `clientAuth`**, plus the
+   control plane's IP in its SANs. The gateway dials etcd's own gRPC listener as
+   a client using this certificate, so `clientAuth` is not optional under
+   `client-cert-auth`.
+4. **`auth enable`**, without which prefix RBAC is inert and tenants are not
+   isolated from one another.
+
+`etcd_dcs_client` probes for all four from each node and fails the run with the
+cause named. `doc/pgsql.md` carries a reference config, the verification command
+and a symptom index.
 
 ## Wiring a new engine
 

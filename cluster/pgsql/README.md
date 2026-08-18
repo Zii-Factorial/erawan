@@ -100,5 +100,14 @@ API — the control plane runs RBAC, which the v2 endpoints do not carry):
 | `patroni_etcd_ca_path` | Control-plane CA installed on the node |
 | `patroni_namespace` | `/db/patroni/` — keys land in `<namespace><cluster>/` |
 
+Patroni's `etcd3` client reaches the control plane over **HTTP** (`POST /v3/...`),
+which etcd serves only with `enable-grpc-gateway: true` — and that is *not* the
+default when etcd is started from a config file. The control plane's other hard
+requirements (tenant certificates with no CommonName, a server certificate
+carrying `clientAuth`, `auth enable`) are listed in `cluster/shared/README.md`,
+with a reference config and symptom index in `doc/pgsql.md`. The
+`control_plane_dcs` step probes for all of them from each node before Patroni is
+asked to start.
+
 Existing clusters are not migrated. Switching a running cluster's DCS means
 moving its Patroni state, which is a deliberate operation, not a config flip.
