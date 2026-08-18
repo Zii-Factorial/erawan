@@ -297,10 +297,22 @@ What each cluster is issued on the control plane:
 | Role | `patroni-<cluster>-role`, `readwrite` on `/db/patroni/<cluster>/` |
 | User | `patroni-<cluster>-user`, granted that role only |
 | Keys | `/db/patroni/<cluster>/…` — leader lock, config, members |
+| Client cert | `CN = patroni-<cluster>-user`, signed by the control plane's CA |
 
 etcd RBAC is prefix-based, so tenants cannot read or write each other's keys.
-Each node holds only the control plane's CA (`/etc/patroni/etcd-ca.pem`) and its
-own username/password — no client certificate, no root credential.
+Each node holds the control plane's CA (`/etc/patroni/etcd-ca.pem`), its tenant
+certificate (`/etc/patroni/etcd-client.pem` + key) and its username/password —
+never the root credential and never another tenant's material.
+
+The client certificate is what a control plane running `client-cert-auth: true`
+demands: it aborts the TLS handshake for a client presenting none, which shows
+up on the node as `tlsv13 alert certificate required` and leaves Patroni looping
+on `waiting on etcd`. Certificates are minted once per tenant from the CA and
+left in place — a redeploy or start/recover never re-mints, so a live cluster
+cannot lose its credential to a routine operation. Rotation is deliberate:
+delete the pair under `/etc/etcd/ssl/erawan-clients/` and re-run the deploy.
+Set `CONTROL_PLANE_ETCD_CLIENT_CERT=false` for a control plane that does not
+require client certificates.
 
 **Lifecycle.** The tenant namespace is created by the `control_plane_dcs` step,
 which runs on every deploy, start/recover and add-member and is idempotent — it

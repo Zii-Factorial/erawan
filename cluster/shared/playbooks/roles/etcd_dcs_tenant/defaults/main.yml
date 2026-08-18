@@ -13,6 +13,25 @@ dcs_ca_file: /etc/etcd/ssl/ca.pem
 dcs_cert_file: /etc/etcd/ssl/cp-etcd-01.pem
 dcs_key_file: /etc/etcd/ssl/cp-etcd-01-key.pem
 
+# ── Per-tenant client certificates ──────────────────────────────────────────
+# An etcd running with client-cert-auth: true refuses the TLS handshake unless
+# the client presents a certificate signed by its CA — the DB nodes cannot
+# reach it with the CA alone. Each tenant therefore gets its own client
+# certificate, minted here from the control plane's CA and installed on that
+# tenant's nodes only, so one tenant's credential can be revoked without
+# touching any other.
+#
+# Set dcs_client_cert_enabled: false for a control plane that does not require
+# client certificates; the nodes then connect with the CA plus their etcd
+# username/password alone and no CA key is needed.
+dcs_client_cert_enabled: true
+dcs_ca_key_file: /etc/etcd/ssl/ca-key.pem
+# Minted certificates live here, one pair per tenant, so they can be inspected,
+# rotated or revoked out of band. Kept off the CA's own directory so the CA
+# serial file this writes never lands next to the CA key.
+dcs_client_cert_dir: /etc/etcd/ssl/erawan-clients
+dcs_client_cert_days: 3650
+
 # The etcd superuser that owns RBAC on the shared control plane. Its password
 # comes from the erawan host's CONTROL_PLANE_ETCD_ROOT_PASSWORD.
 dcs_root_user: root

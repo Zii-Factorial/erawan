@@ -280,6 +280,16 @@ func loadControlPlaneConfig(baseDir string) core.ControlPlane {
 		TenantNamePrefix: env.GetString("CONTROL_PLANE_DCS_TENANT_PREFIX", "patroni"),
 		NodeCAPath:       env.GetString("CONTROL_PLANE_ETCD_NODE_CA_PATH", "/etc/patroni/etcd-ca.pem"),
 		NodeCAOwner:      env.GetString("CONTROL_PLANE_ETCD_NODE_CA_OWNER", "postgres"),
+		// On by default: an etcd hardened with client-cert-auth rejects the TLS
+		// handshake from a client with no certificate, and presenting one to an
+		// etcd that does not require it is harmless — so the safe default is to
+		// issue them. Turn off only for a control plane with no CA key on disk.
+		ClientCert:     env.GetBool("CONTROL_PLANE_ETCD_CLIENT_CERT", true),
+		CAKeyPath:      env.GetString("CONTROL_PLANE_ETCD_CA_KEY", "/etc/etcd/ssl/ca-key.pem"),
+		ClientCertDir:  env.GetString("CONTROL_PLANE_ETCD_CLIENT_CERT_DIR", "/etc/etcd/ssl/erawan-clients"),
+		ClientCertDays: env.GetInt("CONTROL_PLANE_ETCD_CLIENT_CERT_DAYS", 3650),
+		NodeCertPath:   env.GetString("CONTROL_PLANE_ETCD_NODE_CERT_PATH", "/etc/patroni/etcd-client.pem"),
+		NodeKeyPath:    env.GetString("CONTROL_PLANE_ETCD_NODE_KEY_PATH", "/etc/patroni/etcd-client-key.pem"),
 		// The control plane is built from the same node template, so it is
 		// normally reached with the same credentials as the DB nodes; these
 		// override that per field when it is not.

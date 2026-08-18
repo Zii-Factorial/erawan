@@ -77,19 +77,109 @@
       etcdctl stdout: {{ _dcs_provision.stdout | default('(none)') | trim }}
   when: (_dcs_provision.rc | default(1)) != 0
 
-# Published for the client play, which installs it on the cluster nodes: they
-# must trust the control plane's server certificate to speak TLS to it, and
-# this is the only piece of the control plane's TLS material that ever leaves
-# it. Read here (where the file is) rather than shipped from the erawan host,
-# so a rotated CA propagates on the next run with nothing to keep in sync.
+# ── Per-tenant client certificate ───────────────────────────────────────────
+# Required by an etcd running with client-cert-auth: true, which rejects the
+# TLS handshake outright when the client presents no certificate — the failure
+# surfaces on the node as "tlsv13 alert certificate required", before any
+# username/password is ever exchanged.
+#
+# CN is the tenant's etcd user: etcd derives a username from the client
+# certificate's CN when a request carries no auth token, so this credential
+# authorizes as the tenant either way, and never as anyone else.
+- name: Check the CA key needed to sign tenant client certificates
+  ansible.builtin.stat:
+    path: "{{ dcs_ca_key_file }}"
+  register: _dcs_ca_key_stat
+  when: dcs_client_cert_enabled | bool
+
+- name: Fail when the CA key is missing
+  ansible.builtin.fail:
+    msg: >-
+      {{ dcs_ca_key_file }} does not exist on the control plane, so a client
+      certificate cannot be signed for {{ dcs_tenant_user }}. Either place the
+      CA key there (CONTROL_PLANE_ETCD_CA_KEY points at it), or — if this etcd
+      does not run with client-cert-auth — set
+      CONTROL_PLANE_ETCD_CLIENT_CERT=false on the erawan host.
+  when:
+    - dcs_client_cert_enabled | bool
+    - not (_dcs_ca_key_stat.stat.exists | default(false))
+
+- name: Ensure the tenant client certificate directory exists
+  ansible.builtin.file:
+    path: "{{ dcs_client_cert_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: dcs_client_cert_enabled | bool
+
+# `creates:` makes this a one-time mint per tenant: re-running provisioning
+# must not hand a live cluster a new certificate on every deploy, start and
+# add-member, and a stable pair is also what makes rotation an explicit act
+# (delete the pair, re-run) rather than a side effect.
+- name: Sign a client certificate for the tenant
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    cd "{{ dcs_client_cert_dir }}"
+
+    openssl req -new -newkey rsa:2048 -nodes \
+      -keyout "{{ dcs_tenant_user }}-key.pem" \
+      -out "{{ dcs_tenant_user }}.csr" \
+      -subj "/CN={{ dcs_tenant_user }}/O=erawan"
+
+    # clientAuth is not optional: the Go TLS stack inside etcd rejects a
+    # client certificate that does not carry that extended key usage.
+    # (No apostrophes in this block — the free-form shell argument splitter
+    # reads one as an unterminated quote and fails the whole task.)
+    printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n' > "{{ dcs_tenant_user }}.ext"
+
+    openssl x509 -req -sha256 \
+      -in "{{ dcs_tenant_user }}.csr" \
+      -CA "{{ dcs_ca_file }}" -CAkey "{{ dcs_ca_key_file }}" \
+      -CAcreateserial -CAserial "{{ dcs_client_cert_dir }}/ca.srl" \
+      -extfile "{{ dcs_tenant_user }}.ext" \
+      -days {{ dcs_client_cert_days }} \
+      -out "{{ dcs_tenant_user }}.pem"
+
+    rm -f "{{ dcs_tenant_user }}.csr" "{{ dcs_tenant_user }}.ext"
+    chmod 0600 "{{ dcs_tenant_user }}-key.pem" "{{ dcs_tenant_user }}.pem"
+    echo "client-cert-created {{ dcs_tenant_user }}"
+  args:
+    executable: /bin/bash
+    creates: "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem"
+  when: dcs_client_cert_enabled | bool
+
+# Published for the client play, which installs these on the cluster nodes: the
+# CA so they trust the control plane's server certificate, and the tenant pair
+# so the control plane accepts theirs. Read here (where the files are) rather
+# than shipped from the erawan host, so a rotated CA propagates on the next run
+# with nothing to keep in sync.
 - name: Read the control-plane CA certificate
   ansible.builtin.slurp:
     src: "{{ dcs_ca_file }}"
   register: _dcs_ca_blob
 
-- name: Publish the CA certificate for the client play
+- name: Read the tenant client certificate and key
+  ansible.builtin.slurp:
+    src: "{{ dcs_client_cert_dir }}/{{ item }}"
+  loop:
+    - "{{ dcs_tenant_user }}.pem"
+    - "{{ dcs_tenant_user }}-key.pem"
+  register: _dcs_client_pair
+  no_log: true
+  when: dcs_client_cert_enabled | bool
+
+- name: Publish the TLS material for the client play
   ansible.builtin.set_fact:
     dcs_ca_content: "{{ _dcs_ca_blob.content | b64decode }}"
+    dcs_client_cert_content: >-
+      {{ (_dcs_client_pair.results[0].content | b64decode)
+         if (dcs_client_cert_enabled | bool) else '' }}
+    dcs_client_key_content: >-
+      {{ (_dcs_client_pair.results[1].content | b64decode)
+         if (dcs_client_cert_enabled | bool) else '' }}
+  no_log: true
 
 - name: Check UFW availability and status on the control plane
   ansible.builtin.command:

@@ -17,6 +17,14 @@ etcd3:
     - {{ control_plane_ip }}:{{ control_plane_etcd_client_port }}
   protocol: https
   cacert: {{ patroni_etcd_ca_path }}
+{% if (patroni_etcd_client_cert_path | default('')) | length > 0 %}
+{# Required when the control plane runs client-cert-auth: without a client
+   certificate it aborts the TLS handshake ("certificate required") before any
+   credential is exchanged. The pair is this tenant's own, minted from the
+   control plane's CA with CN = the tenant's etcd user. #}
+  cert: {{ patroni_etcd_client_cert_path }}
+  key: {{ patroni_etcd_client_key_path }}
+{% endif %}
   username: {{ control_plane_etcd_user }}
   password: {{ control_plane_etcd_password | to_json }}
 {% else %}

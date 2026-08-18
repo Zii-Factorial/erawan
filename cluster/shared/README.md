@@ -22,19 +22,32 @@ one node included — then works, and the DB nodes run no etcd at all.
 
 ## What a tenant gets
 
-Each cluster (tenant) is issued exactly one etcd role, one user and one key
-prefix on the shared control plane:
+Each cluster (tenant) is issued its own etcd role, user, key prefix and client
+certificate on the shared control plane:
 
 ```
 role  patroni-<cluster>-role   readwrite on /db/patroni/<cluster>/
 user  patroni-<cluster>-user   granted that role and nothing else
 keys  /db/patroni/<cluster>/…  Patroni's leader, config, members, …
+cert  CN=patroni-<cluster>-user signed by the control plane CA
 ```
 
 etcd RBAC is prefix-based, which is what keeps tenants off each other's keys on
-infrastructure they all share. The DB nodes hold only the control plane's CA and
-their own username/password — never a client certificate, never the root
-credential, and no reach outside their own prefix.
+infrastructure they all share. The DB nodes hold the control plane's CA, their
+own tenant certificate and their own username/password — never the root
+credential, never another tenant's material, and no reach outside their prefix.
+
+The client certificate exists because a control plane running
+`client-cert-auth: true` aborts the TLS handshake for a client that presents
+none, long before any username/password is exchanged. Each tenant gets its own
+so it can be revoked independently, and the CN is the tenant's etcd user —
+which also lines up with etcd deriving a username from the certificate when a
+request carries no auth token. Minting is one-time per tenant (`creates:`), so
+the routine re-runs below never hand a live cluster a new credential; rotation
+means deleting the pair under `dcs_client_cert_dir` and re-running. Set
+`dcs_client_cert_enabled: false` for a control plane that does not require them
+— it is also the only setting that needs the CA private key on the control
+plane.
 
 ## Playbooks
 

@@ -37,12 +37,23 @@ type ControlPlane struct {
 	// EtcdClientPort is the port both the DB nodes and etcdctl dial.
 	EtcdClientPort int
 
-	// CACertPath, CertPath and KeyPath are paths ON the control-plane host.
-	// etcdctl runs there over SSH, so only CACertPath is ever copied outward
-	// (to the DB nodes, which must trust the control plane's server cert).
+	// CACertPath, CertPath and KeyPath are paths ON the control-plane host,
+	// used by etcdctl over SSH. The server key never leaves the control plane;
+	// only the CA does, plus per-tenant client certificates minted from it.
 	CACertPath string
 	CertPath   string
 	KeyPath    string
+
+	// ClientCert controls whether each tenant is issued its own client
+	// certificate. Required by a control plane running with client-cert-auth,
+	// which refuses the TLS handshake to a client presenting none. CAKeyPath
+	// is the CA private key that signs them, and ClientCertDir is where the
+	// minted pairs are kept on the control plane so they can be inspected,
+	// rotated or revoked.
+	ClientCert     bool
+	CAKeyPath      string
+	ClientCertDir  string
+	ClientCertDays int
 
 	// RootUser/RootPassword own RBAC on the shared etcd. Used only by the
 	// control-plane plays; a DB node never sees them.
@@ -56,10 +67,13 @@ type ControlPlane struct {
 	TenantNamePrefix string
 
 	// NodeCAPath is where the control plane's CA is installed on each DB node,
-	// and NodeCAOwner is the OS user that must be able to read it (the engine's
+	// NodeCertPath/NodeKeyPath where that node's client certificate goes, and
+	// NodeCAOwner is the OS user that must be able to read them (the engine's
 	// service account — postgres for Patroni).
-	NodeCAPath  string
-	NodeCAOwner string
+	NodeCAPath   string
+	NodeCertPath string
+	NodeKeyPath  string
+	NodeCAOwner  string
 
 	// SSH overrides for reaching the control plane. Empty fields fall back to
 	// the cluster's own SSH settings: the control plane is built from the same
@@ -220,6 +234,13 @@ func (c ControlPlane) DCSVars(t ControlPlaneTarget) map[string]any {
 		"dcs_client_ca_path":  c.NodeCAPath,
 		"dcs_client_ca_owner": c.NodeCAOwner,
 		"dcs_client_ca_group": c.NodeCAOwner,
+
+		"dcs_client_cert_enabled": c.ClientCert,
+		"dcs_ca_key_file":         c.CAKeyPath,
+		"dcs_client_cert_dir":     c.ClientCertDir,
+		"dcs_client_cert_days":    c.ClientCertDays,
+		"dcs_client_cert_path":    c.NodeCertPath,
+		"dcs_client_key_path":     c.NodeKeyPath,
 	}
 }
 

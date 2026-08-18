@@ -182,7 +182,7 @@ func (r *Runner) controlPlaneVars(spec StoredSpec, dcsPassword string) map[strin
 	if !r.usesControlPlane(spec) {
 		return nil
 	}
-	return map[string]any{
+	vars := map[string]any{
 		"control_plane_ip":               r.controlPlane.IP,
 		"control_plane_etcd_client_port": r.controlPlane.EtcdClientPort,
 		"control_plane_etcd_user":        r.controlPlane.TenantUser(spec.ClusterName),
@@ -193,6 +193,14 @@ func (r *Runner) controlPlaneVars(spec StoredSpec, dcsPassword string) map[strin
 		// control plane's, not the per-node default.
 		"patroni_namespace": r.controlPlane.Namespace,
 	}
+	// Rendered into patroni.yml only when the tenant holds a client
+	// certificate; a control plane running client-cert-auth refuses the TLS
+	// handshake without one.
+	if r.controlPlane.ClientCert {
+		vars["patroni_etcd_client_cert_path"] = r.controlPlane.NodeCertPath
+		vars["patroni_etcd_client_key_path"] = r.controlPlane.NodeKeyPath
+	}
+	return vars
 }
 
 /**

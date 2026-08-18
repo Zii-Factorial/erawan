@@ -211,6 +211,11 @@ Both should succeed (`clusterops`, then `root`).
 | `CONTROL_PLANE_ETCD_CACERT` / `_CERT` / `_KEY` | `/etc/etcd/ssl/{ca,cp-etcd-01,cp-etcd-01-key}.pem` | TLS material as it exists **on the control plane**; only the CA is copied to DB nodes |
 | `CONTROL_PLANE_DCS_NAMESPACE` | `/db/patroni/` | Key namespace; a tenant owns `<namespace><cluster_name>/` |
 | `CONTROL_PLANE_DCS_TENANT_PREFIX` | `patroni` | Names the per-tenant etcd role/user (`<prefix>-<cluster>-role`/`-user`) |
+| `CONTROL_PLANE_ETCD_CLIENT_CERT` | `true` | Issue each cluster its own etcd client certificate. Required by a control plane running `client-cert-auth: true`, which refuses the TLS handshake without one. Needs the CA key below |
+| `CONTROL_PLANE_ETCD_CA_KEY` | `/etc/etcd/ssl/ca-key.pem` | CA private key on the control plane that signs tenant client certificates |
+| `CONTROL_PLANE_ETCD_CLIENT_CERT_DIR` | `/etc/etcd/ssl/erawan-clients` | Where minted tenant certificates are kept on the control plane |
+| `CONTROL_PLANE_ETCD_CLIENT_CERT_DAYS` | `3650` | Validity of a minted tenant certificate |
+| `CONTROL_PLANE_ETCD_NODE_CERT_PATH` / `_KEY_PATH` | `/etc/patroni/etcd-client{,-key}.pem` | Where the tenant certificate lands on each DB node |
 | `CONTROL_PLANE_ETCD_NODE_CA_PATH` | `/etc/patroni/etcd-ca.pem` | Where the control plane's CA lands on each DB node |
 | `CONTROL_PLANE_ETCD_NODE_CA_OWNER` | `postgres` | OS user that must read that CA (the engine's service account) |
 | `CONTROL_PLANE_SSH_USER` / `_PRIVATE_KEY_PATH` / `_PORT` | — | Overrides for reaching the control plane; defaults to the cluster SSH credentials |

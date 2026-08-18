@@ -28,6 +28,21 @@
     group: "{{ dcs_client_ca_group }}"
     mode: "{{ dcs_client_ca_mode }}"
 
+- name: Install the tenant client certificate
+  ansible.builtin.copy:
+    content: "{{ item.content }}"
+    dest: "{{ item.dest }}"
+    owner: "{{ dcs_client_ca_owner }}"
+    group: "{{ dcs_client_ca_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { content: "{{ dcs_client_cert_content | default('') }}", dest: "{{ dcs_client_cert_path }}", mode: "0644" }
+    - { content: "{{ dcs_client_key_content | default('') }}", dest: "{{ dcs_client_key_path }}", mode: "0600" }
+  loop_control:
+    label: "{{ item.dest }}"
+  no_log: true
+  when: dcs_client_cert_enabled | bool
+
 - name: Verify the node can reach and trust the control-plane DCS
   block:
     - name: Wait for the control-plane client port from this node
@@ -37,21 +52,24 @@
         state: started
         timeout: 30
 
-    # -verify_ip is the check that matters: the engine verifies the control
-    # plane's certificate against the IP it dials, so a server certificate
-    # without that IP in its SANs produces a cluster that starts, fails every
-    # DCS call, and reports only a TLS error deep in the engine's journal.
-    # Catch it here, once, with the actual reason.
-    - name: Verify the control-plane server certificate against the installed CA
-      ansible.builtin.shell: |
-        set -euo pipefail
-        openssl s_client \
-          -connect {{ dcs_endpoint_ip }}:{{ dcs_client_port }} \
-          -CAfile {{ dcs_client_ca_path }} \
-          -verify_ip {{ dcs_endpoint_ip }} \
-          -verify_return_error </dev/null >/dev/null
-      args:
-        executable: /bin/bash
+    # Deliberately the same request the engine's DCS client makes, with the
+    # same files: it is the only check that exercises the whole path at once —
+    # server certificate trusted against the installed CA, the IP present in
+    # its SANs, and the client certificate accepted by a control plane running
+    # client-cert-auth. An openssl s_client handshake test is NOT equivalent:
+    # under TLS 1.3 the server's "certificate required" alert arrives after
+    # the handshake completes, so it exits 0 on a connection the engine cannot
+    # actually use, and the failure resurfaces minutes later as a DCS timeout.
+    - name: Verify the control-plane etcd answers this node over TLS
+      ansible.builtin.uri:
+        url: "https://{{ dcs_endpoint_ip }}:{{ dcs_client_port }}/version"
+        ca_path: "{{ dcs_client_ca_path }}"
+        client_cert: "{{ dcs_client_cert_path if (dcs_client_cert_enabled | bool) else omit }}"
+        client_key: "{{ dcs_client_key_path if (dcs_client_cert_enabled | bool) else omit }}"
+        validate_certs: true
+        return_content: true
+        status_code: 200
+      register: _dcs_probe
       changed_when: false
   rescue:
     - name: Fail with the control-plane connectivity reason
@@ -61,7 +79,14 @@
           {{ dcs_endpoint_ip }}:{{ dcs_client_port }}:
           {{ ansible_failed_result.msg | default('') }}
           {{ ansible_failed_result.stderr | default('') | trim }}
-          Usual causes: the control plane's firewall does not allow this node
-          yet, etcd is not listening on {{ dcs_endpoint_ip }}, or its server
-          certificate does not carry {{ dcs_endpoint_ip }} in its SANs (the
-          engine verifies the certificate against the IP it dials).
+          Usual causes, by the error above:
+            "certificate required"  — the control plane runs client-cert-auth
+              but this node has no client certificate; check that the
+              control-plane play minted one (CONTROL_PLANE_ETCD_CLIENT_CERT).
+            "certificate verify failed" / "IP address mismatch" — the control
+              plane's server certificate is not signed by the installed CA, or
+              does not carry {{ dcs_endpoint_ip }} in its SANs. The engine
+              verifies the certificate against the IP it dials.
+            "timed out" / "refused" — the control plane's firewall does not
+              allow this node yet, or etcd is not listening on
+              {{ dcs_endpoint_ip }}.

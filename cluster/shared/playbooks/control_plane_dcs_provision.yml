@@ -35,5 +35,7 @@
   any_errors_fatal: true
   vars:
     dcs_ca_content: "{{ hostvars[groups['control_plane'][0]].dcs_ca_content }}"
+    dcs_client_cert_content: "{{ hostvars[groups['control_plane'][0]].dcs_client_cert_content | default('') }}"
+    dcs_client_key_content: "{{ hostvars[groups['control_plane'][0]].dcs_client_key_content | default('') }}"
   roles:
     - etcd_dcs_client
