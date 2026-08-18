@@ -83,9 +83,17 @@
 # surfaces on the node as "tlsv13 alert certificate required", before any
 # username/password is ever exchanged.
 #
-# CN is the tenant's etcd user: etcd derives a username from the client
-# certificate's CN when a request carries no auth token, so this credential
-# authorizes as the tenant either way, and never as anyone else.
+# The certificate carries NO CommonName, and that is load-bearing. When
+# client-cert-auth and RBAC auth are both on, etcd rejects every request that
+# reaches its gRPC JSON gateway bearing a client certificate with a CN:
+#
+#   HTTP 400 CommonName of client sending a request against gateway will be
+#            ignored and not used as expected        (etcd embed/serve.go)
+#
+# Patroni reaches the DCS only over that gateway, so a CN here breaks the whole
+# cluster rather than one call. The tenant is identified by its RBAC username
+# and password instead — a CN would have been a second, redundant identity that
+# etcd cannot convey across the gateway anyway.
 - name: Check the CA key needed to sign tenant client certificates
   ansible.builtin.stat:
     path: "{{ dcs_ca_key_file }}"
@@ -113,6 +121,31 @@
     mode: "0700"
   when: dcs_client_cert_enabled | bool
 
+# A pair minted before the CN-less rule above makes every one of this tenant's
+# DCS requests fail, and the `creates:` guard below would keep it in place
+# forever. Removing it here is what lets the mint step re-issue it — and this
+# playbook runs on every deploy, start/recover and add-member, so an affected
+# tenant heals on its next operation with nothing to do by hand.
+- name: Retire a tenant client certificate that still carries a CommonName
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cert="{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}.pem"
+    if [ ! -f "$cert" ]; then
+      exit 0
+    fi
+    # sep_multiline puts one RDN per line, so a CN is matched as its own field
+    # and never as a substring of some other value. The indent openssl uses for
+    # those lines has changed between releases, hence the leading " *".
+    if openssl x509 -in "$cert" -noout -subject -nameopt sep_multiline | grep -qE "^ *CN="; then
+      rm -f "$cert" "{{ dcs_client_cert_dir }}/{{ dcs_tenant_user }}-key.pem"
+      echo "retired-cn-certificate {{ dcs_tenant_user }}"
+    fi
+  args:
+    executable: /bin/bash
+  register: _dcs_cert_retire
+  changed_when: "'retired-cn-certificate' in (_dcs_cert_retire.stdout | default(''))"
+  when: dcs_client_cert_enabled | bool
+
 # `creates:` makes this a one-time mint per tenant: re-running provisioning
 # must not hand a live cluster a new certificate on every deploy, start and
 # add-member, and a stable pair is also what makes rotation an explicit act
@@ -126,7 +159,7 @@
     openssl req -new -newkey rsa:2048 -nodes \
       -keyout "{{ dcs_tenant_user }}-key.pem" \
       -out "{{ dcs_tenant_user }}.csr" \
-      -subj "/CN={{ dcs_tenant_user }}/O=erawan"
+      -subj "/O=erawan"
 
     # clientAuth is not optional: the Go TLS stack inside etcd rejects a
     # client certificate that does not carry that extended key usage.

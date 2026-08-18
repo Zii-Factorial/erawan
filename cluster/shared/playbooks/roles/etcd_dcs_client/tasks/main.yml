@@ -90,3 +90,89 @@
             "timed out" / "refused" — the control plane's firewall does not
               allow this node yet, or etcd is not listening on
               {{ dcs_endpoint_ip }}.
+
+# ── The v3 API gateway ──────────────────────────────────────────────────────
+# /version above is served by etcd's own HTTP handler, which answers even on a
+# control plane started with enable-grpc-gateway: false. Everything the engine's
+# DCS client does after start-up is a POST under /v3, which ONLY that gateway
+# serves — so the probe above passes and the cluster still fails minutes later,
+# opaquely: Patroni JSON-decodes the gateway's plain-text "404 page not found"
+# body, gets the integer 404 back, and dies on
+#   AttributeError: 'int' object has no attribute 'get'
+# deep inside patroni/dcs/etcd3.py, with nothing naming the real cause.
+#
+# The control-plane play cannot catch this either — etcdctl speaks gRPC on the
+# same port, and gRPC stays up when the gateway is off, so tenant provisioning
+# succeeds against an etcd that no cluster node can actually use.
+#
+# Probing the exact request Patroni makes first is the only check that covers
+# it, and it proves the tenant credential at the same time.
+- name: Probe the control-plane v3 API from this node
+  ansible.builtin.uri:
+    url: "https://{{ dcs_endpoint_ip }}:{{ dcs_client_port }}/v3/auth/authenticate"
+    method: POST
+    body_format: json
+    body:
+      name: "{{ dcs_tenant_user }}"
+      password: "{{ dcs_tenant_password | default('') }}"
+    ca_path: "{{ dcs_client_ca_path }}"
+    client_cert: "{{ dcs_client_cert_path if (dcs_client_cert_enabled | bool) else omit }}"
+    client_key: "{{ dcs_client_key_path if (dcs_client_cert_enabled | bool) else omit }}"
+    validate_certs: true
+    return_content: true
+  register: _dcs_v3_probe
+  changed_when: false
+  # Every outcome is classified by the tasks below. Letting the module decide
+  # would bury the diagnosis under a generic "status code was not [200]".
+  failed_when: false
+  # The request body carries the tenant password and a 200 response carries its
+  # auth token. Only the status — and, on the error paths, etcd's own message —
+  # are ever surfaced below.
+  no_log: true
+
+- name: Fail when the control plane does not serve the v3 API over HTTP
+  ansible.builtin.fail:
+    msg: |
+      The control-plane etcd at {{ dcs_endpoint_ip }}:{{ dcs_client_port }} serves
+      /version but answers HTTP 404 for POST /v3/auth/authenticate, so its gRPC
+      JSON gateway is switched off. Patroni reaches the DCS over exactly that
+      gateway and cannot start against this control plane — it fails later as
+      AttributeError: 'int' object has no attribute 'get'.
+      Fix this on the control plane, not here: set
+        enable-grpc-gateway: true
+      in its etcd configuration and restart etcd. Note that the restart affects
+      every tenant whose Patroni cluster keeps its state on this control plane.
+  when: (_dcs_v3_probe.status | default(0)) == 404
+
+# Patroni survives this one (it catches AuthNotEnabled and carries on with no
+# token), so it is a warning rather than a failure — but RBAC is the only thing
+# keeping tenants off each other's keys on a shared control plane, so a deploy
+# should never pass through it silently.
+- name: Warn when the control plane has authentication disabled
+  ansible.builtin.debug:
+    msg: >-
+      The control-plane etcd at {{ dcs_endpoint_ip }}:{{ dcs_client_port }}
+      reports that authentication is not enabled. The cluster will start, but
+      until `etcdctl auth enable` is run there, every tenant on this control
+      plane can read and write every other tenant's Patroni state.
+  when: "'authentication is not enabled' in (_dcs_v3_probe.content | default(''))"
+
+- name: Fail when the control plane does not accept the tenant credential
+  ansible.builtin.fail:
+    msg: |
+      The control-plane etcd at {{ dcs_endpoint_ip }}:{{ dcs_client_port }} did not
+      accept the DCS authentication request for {{ dcs_tenant_user }}:
+        HTTP {{ _dcs_v3_probe.status | default('(no response)') }}
+        {{ _dcs_v3_probe.content | default('') | trim }}
+        {{ _dcs_v3_probe.msg | default('') | trim }}
+      Patroni authenticates as this user on every start, so the cluster cannot
+      come up until this request succeeds. By the error above:
+        "invalid user ID or password" — the tenant user was dropped from the
+          control plane out of band, or this job's DCS password is not the one
+          the control plane holds for it.
+        anything else — the control plane is reachable but not healthy enough
+          to serve the request; check etcd's own status there.
+  when:
+    - (_dcs_v3_probe.status | default(0)) != 200
+    - (_dcs_v3_probe.status | default(0)) != 404
+    - "'authentication is not enabled' not in (_dcs_v3_probe.content | default(''))"
