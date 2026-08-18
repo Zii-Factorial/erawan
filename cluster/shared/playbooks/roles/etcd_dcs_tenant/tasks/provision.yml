@@ -109,7 +109,7 @@
     proto: tcp
     src: "{{ item }}"
     comment: erawan control-plane DCS client
-  loop: "{{ dcs_client_ips | unique }}"
+  loop: "{{ dcs_client_ips | default([], true) | unique }}"
   when:
     - _dcs_ufw_status.rc == 0
     - "'Status: active' in (_dcs_ufw_status.stdout | default(''))"
@@ -117,6 +117,11 @@
 # Nodes that just left this cluster (remove-member) or were replaced by a scale
 # operation. Their grant has to go with them: CloudStack recycles IPs, so a
 # later unrelated VM would inherit reach to the control plane's client port.
+#
+# Both lists are defaulted with the boolean form: an operation that has no
+# nodes for one of them (a cleanup run has no clients, a deploy has nothing to
+# revoke) passes it through as JSON null, which is DEFINED — so the plain
+# `default([])` never fires and the filter below is handed a None.
 - name: Revoke departed nodes from the control-plane client port
   community.general.ufw:
     rule: allow
@@ -124,7 +129,10 @@
     proto: tcp
     src: "{{ item }}"
     delete: true
-  loop: "{{ dcs_revoke_ips | default([]) | difference(dcs_client_ips) | unique }}"
+  loop: >-
+    {{ dcs_revoke_ips | default([], true)
+       | difference(dcs_client_ips | default([], true))
+       | unique }}
   when:
     - _dcs_ufw_status.rc == 0
     - "'Status: active' in (_dcs_ufw_status.stdout | default(''))"

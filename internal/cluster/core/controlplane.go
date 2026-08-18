@@ -215,12 +215,33 @@ func (c ControlPlane) DCSVars(t ControlPlaneTarget) map[string]any {
 		"dcs_tenant_user":     c.TenantUser(t.Scope),
 		"dcs_tenant_role":     c.TenantRole(t.Scope),
 		"dcs_tenant_password": t.TenantPassword,
-		"dcs_client_ips":      t.ClientIPs,
-		"dcs_revoke_ips":      t.RevokeIPs,
+		"dcs_client_ips":      orEmpty(t.ClientIPs),
+		"dcs_revoke_ips":      orEmpty(t.RevokeIPs),
 		"dcs_client_ca_path":  c.NodeCAPath,
 		"dcs_client_ca_owner": c.NodeCAOwner,
 		"dcs_client_ca_group": c.NodeCAOwner,
 	}
+}
+
+/**
+ * orEmpty returns a non-nil slice. A nil slice marshals to JSON null, which
+ * Ansible treats as a DEFINED variable holding None — so `| default([])` in a
+ * playbook never fires for it and any list filter downstream raises. Every
+ * control-plane run leaves one of the two node lists empty (a cleanup has no
+ * clients, a deploy has nothing to revoke), so this is the normal case, not an
+ * edge one.
+ *
+ * Params:
+ *   in []string - the slice to normalize
+ *
+ * Returns:
+ *   []string - in, or an empty non-nil slice when in is nil
+ */
+func orEmpty(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
 }
 
 /**

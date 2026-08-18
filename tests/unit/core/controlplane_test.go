@@ -1,6 +1,7 @@
 package core_test
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -168,5 +169,35 @@ func TestControlPlaneInventoryHonoursSSHOverrides(t *testing.T) {
 	}
 	if !strings.Contains(clientHost, "clusterops") || !strings.Contains(clientHost, "ansible_port: 22") {
 		t.Errorf("client host must keep the cluster's own SSH settings:\n%s", clientHost)
+	}
+}
+
+func TestControlPlaneDCSVarsNeverEmitNullLists(t *testing.T) {
+	cp := enabledControlPlane()
+
+	// A cleanup run carries no client nodes and a deploy carries nothing to
+	// revoke, so one of the two lists is always nil on the Go side. Marshalled
+	// as JSON null it reaches Ansible as a DEFINED None, which `| default([])`
+	// does not catch and every list filter downstream raises on.
+	for name, target := range map[string]core.ControlPlaneTarget{
+		"cleanup (no clients)": {Scope: "t1", RevokeIPs: []string{"10.10.1.10"}},
+		"deploy (no revokes)":  {Scope: "t1", ClientIPs: []string{"10.10.1.10"}},
+		"neither":              {Scope: "t1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			encoded, err := json.Marshal(cp.DCSVars(target))
+			if err != nil {
+				t.Fatalf("marshal vars: %v", err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(encoded, &decoded); err != nil {
+				t.Fatalf("unmarshal vars: %v", err)
+			}
+			for _, key := range []string{"dcs_client_ips", "dcs_revoke_ips"} {
+				if decoded[key] == nil {
+					t.Errorf("%s marshalled to null; Ansible needs an empty list", key)
+				}
+			}
+		})
 	}
 }

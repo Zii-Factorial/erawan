@@ -74,7 +74,7 @@
     proto: tcp
     src: "{{ item }}"
     delete: true
-  loop: "{{ dcs_client_ips | unique }}"
+  loop: "{{ dcs_client_ips | default([], true) | unique }}"
   when:
     - _dcs_ufw_status.rc == 0
     - "'Status: active' in (_dcs_ufw_status.stdout | default(''))"
