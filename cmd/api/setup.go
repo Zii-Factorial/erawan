@@ -81,7 +81,6 @@ func buildApplication(ctx context.Context, cfg runtimeConfig) (*application, err
 		pgsqlDB:              dbmanager.NewService(pgsqlStore, cfg.server.proxyHost),
 		mysqlDB:              mysqldbmanager.NewService(mysqlStore, cfg.server.proxyHost),
 		cipher:               cipher,
-		baseDir:              cfg.baseDir,
 		enablePprof:          cfg.enablePprof,
 		shutdownDrainSeconds: cfg.shutdownDrainSeconds,
 		jobDB:                jobDB,

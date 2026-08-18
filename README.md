@@ -1,7 +1,3 @@
-<p >
-  <img src="doc/assets/A5172f582418f41729f3c587f6a5f95e6w.png" alt="erawan-cluster logo" width="180"/>
-</p>
-
 # erawan-cluster
 
 **Version 1.02** — Cluster Management API for automated database cluster lifecycle management, live metrics collection, and HAProxy configuration.

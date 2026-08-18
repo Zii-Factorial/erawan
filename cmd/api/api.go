@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof handlers on the loopback pprof server
-	"path/filepath"
 	"time"
 
 	mysqlcluster "erawan-cluster/internal/cluster/mysql"
@@ -38,7 +37,6 @@ type application struct {
 	pgsqlDB              *dbmanager.Service
 	mysqlDB              *mysqldbmanager.Service
 	cipher               *security.Cipher
-	baseDir              string
 	enablePprof          bool
 	shutdownDrainSeconds int
 	jobDB                *sql.DB
@@ -69,7 +67,6 @@ func (app *application) mount() *chi.Mux {
 	r.Use(security.DecryptMiddleware(app.cipher))
 
 	r.Get("/health", app.healthCheckHandler)
-	r.Get("/docs", app.docsHandler)
 
 	haproxyH := haproxyapi.New(app.haproxy)
 	r.Route("/haproxy", func(r chi.Router) {
@@ -238,18 +235,4 @@ func bodyLimit(limit int64) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-/**
- * docsHandler serves the static API documentation page (index.html) from the
- * project base directory.
- *
- * Receiver:
- *   app *application - supplies baseDir, the root the file is resolved against.
- * Params:
- *   w http.ResponseWriter - the response writer the file is streamed to.
- *   r *http.Request - the incoming request, forwarded to http.ServeFile.
- */
-func (app *application) docsHandler(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, filepath.Join(app.baseDir, "index.html"))
 }
