@@ -115,8 +115,7 @@ write_files:
       set -euo pipefail
 
       SSL_DIR=${SSL_DIR:-/etc/etcd/ssl}
-      CA_ORG=${CA_ORG:-erawan}
-      CA_CN=${CA_CN:-erawan-etcd-ca}
+      CA_CN=${CA_CN:-etcd-ca}
 
       mkdir -p "$SSL_DIR"
       for f in ca.pem ca-key.pem ca-config.json; do
@@ -136,23 +135,26 @@ write_files:
       cat > "${SSL_DIR}/ca-config.json" <<'JSON'
       {
         "signing": {
-          "default": { "expiry": "87600h" },
+          "default": {"expiry": "87600h"},
           "profiles": {
             "server": {
               "expiry": "87600h",
-              "usages": ["signing", "key encipherment", "server auth", "client auth"]
+              "usages": ["signing","key encipherment","server auth","client auth"]
             }
           }
         }
       }
       JSON
 
+      # ca.expiry is not decoration: without it cfssl gives the CA a 5-year
+      # lifetime while the profile above signs leaf certificates for 10, and
+      # erawan mints tenant certificates for 3650 days - a CA that expires
+      # first takes every tenant down on that date.
       cat > /tmp/ca-csr.json <<JSON
       {
         "CN": "${CA_CN}",
-        "key": { "algo": "rsa", "size": 2048 },
-        "names": [ { "O": "${CA_ORG}" } ],
-        "ca": { "expiry": "175200h" }
+        "key": {"algo": "rsa", "size": 2048},
+        "ca": {"expiry": "175200h"}
       }
       JSON
 
