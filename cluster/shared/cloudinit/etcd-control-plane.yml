@@ -316,9 +316,9 @@ write_files:
         echo "      systemctl stop etcd && rm -rf /var/lib/etcd/* && rm -f /etc/etcd/.regen-done-*"
         echo "    then re-run: systemctl restart etcd-regen-config.service"
         echo ""
-        echo "  A live control plane whose IP changed? Do NOT wipe it. Restore the old"
-        echo "    address, or recover deliberately (etcdctl member update, or restore from"
-        echo "    an etcdctl snapshot). See doc/control-plane.md."
+        echo "  A live control plane whose IP changed? Do NOT wipe it. Re-sign the cert"
+        echo "    for the new address first, then etcdctl member update. See"
+        echo "    doc/control-plane.md - Changing the control plane private IP."
         exit 1
       fi
 

@@ -13,8 +13,9 @@ enable` is this document.
 
 Steps 1–9 below build one, in order. After them come the operational notes:
 [rollback and revoking access](#rollback-and-revoking-access),
-[more members](#adding-more-control-plane-members), [rotation](#rotation) and
-[troubleshooting](#troubleshooting).
+[more members](#adding-more-control-plane-members),
+[changing its IP](#changing-the-control-planes-private-ip), [rotation](#rotation)
+and [troubleshooting](#troubleshooting).
 
 **Run every command as root** (`sudo -i`). Most of the files live in
 `/etc/etcd/ssl`, which is not writable by a normal user, so a half-`sudo`'d
@@ -38,6 +39,11 @@ The member name is not cosmetic: it names the server certificate, and erawan
 reads that certificate by path. `CONTROL_PLANE_ETCD_CERT` / `_KEY` default to
 `cp-etcd-01{,-key}.pem`, so either the host is called `cp-etcd-01` or you set
 the name on both sides.
+
+The IP is an example throughout, not a constant: this host is a template, and a
+clone of it comes up on whatever address it is handed. Re-addressing one —
+cloned or live — is [changing the control plane's private
+IP](#changing-the-control-planes-private-ip).
 
 ## Prerequisites
 
@@ -502,6 +508,217 @@ Two limits worth knowing before you build three of these:
 - **Erawan's TLS material is per-host.** `CONTROL_PLANE_ETCD_CERT` names one
   certificate, so the host erawan SSHes into is the one whose name has to match.
 
+## Changing the control plane's private IP
+
+This host is a template. Clone the image and it boots on whatever address it is
+handed, so the address in every file above is a value, not a constant — and the
+cloud-init in
+[`cluster/shared/cloudinit/etcd-control-plane.yml`](../cluster/shared/cloudinit/etcd-control-plane.yml)
+is built around that: `etcd-regen-config.service` detects the private IP at
+boot, re-signs the server certificate for it, re-renders `etcd.conf.yml` from
+`/etc/etcd/etcd.conf.yml.j2` and restarts etcd.
+
+Which path you take depends on one question: **does `/var/lib/etcd/member` hold
+tenants?** A clone that has never served anything is re-addressed by wiping it.
+A control plane that moved is not — that directory is every tenant's Patroni
+state, every etcd user and role, and the `auth enable` flag.
+
+### What editing the config does not fix
+
+Rewriting the address in `/etc/etcd/etcd.conf.yml` is one of four places it
+lives, and the other three are invisible to `grep -rn 10.10.3.66 /etc/etcd/`:
+
+| Also holds the old address | Why the grep misses it |
+|---|---|
+| The server certificate's SANs | They are DER inside the `.pem`, not text. Read them with `openssl x509 -in /etc/etcd/ssl/cp-etcd-01.pem -noout -ext subjectAltName`. A node dialling the new address gets `certificate verify failed` from a certificate that still names the old one |
+| The raft membership record | `initial-cluster` and `initial-advertise-peer-urls` are read at bootstrap and ignored ever after; the live peer URL is in `/var/lib/etcd/member`. Only `etcdctl member update` changes it |
+| `/etc/etcd/regen.env` | If `ETCD_INITIAL_CLUSTER` is pinned there with the old address, the next boot re-renders `etcd.conf.yml` straight back to it |
+| `/etc/etcd/.regen-done-<old-ip>` | The marker is per address, so the new address has none. The next boot therefore re-runs the regen script — and if the certificate still needs re-signing while `/var/lib/etcd/member` is populated, it refuses to start etcd rather than guess which of the two you meant |
+
+`/etc/systemd/system/etcd.service.d/override.conf` is the one file that never
+carries an address — it is `ExecStart=/usr/bin/etcd --config-file=…` and nothing
+else. Editing it is harmless and changes nothing.
+
+### Re-address the host first — certificate, then config
+
+Both paths below start here, and the order matters: sealing a clone
+re-bootstraps etcd from `initial-cluster`, so a data wipe done before the
+address is fixed brings the new cluster straight back up advertising the old
+one.
+
+Example: `10.10.3.66` → `10.10.2.86`. Back up before anything, because
+re-signing overwrites the pair in place — see
+[rolling back a change to this host](#rolling-back-a-change-to-this-host):
+
+```bash
+NEW_IP=10.10.2.86
+OLD_IP=10.10.3.66
+NODE=$(hostname)         # the `name:` in etcd.conf.yml; also the cert filename
+
+cp -a /etc/etcd/etcd.conf.yml /etc/etcd/etcd.conf.yml.$(date +%Y%m%dT%H%M%S)
+cp -a /etc/etcd/ssl/$NODE.pem     /etc/etcd/ssl/$NODE.pem.bak
+cp -a /etc/etcd/ssl/$NODE-key.pem /etc/etcd/ssl/$NODE-key.pem.bak
+```
+
+Re-sign for the new address. Keep `127.0.0.1` and `localhost` — the gRPC gateway
+dials the loopback entry, and it is also the endpoint you use below while the
+address is in flux — and keep the **old** address until the whole fleet has
+moved off it:
+
+```bash
+cd /etc/etcd/ssl
+cat > /tmp/$NODE-csr.json <<EOF
+{
+  "CN": "$NODE",
+  "hosts": ["$NODE", "$NEW_IP", "$OLD_IP", "127.0.0.1", "localhost"],
+  "key": {"algo": "rsa", "size": 2048}
+}
+EOF
+
+cfssl gencert -ca=ca.pem -ca-key=ca-key.pem \
+  -config=ca-config.json -profile=server /tmp/$NODE-csr.json | cfssljson -bare $NODE
+rm -f /tmp/$NODE-csr.json $NODE.csr
+
+chown root:etcd $NODE.pem $NODE-key.pem
+chmod 644 $NODE.pem
+chmod 640 $NODE-key.pem
+```
+
+Then both files that carry the address, and the marker that is keyed to it:
+
+```bash
+sed -i "s/$OLD_IP/$NEW_IP/g" /etc/etcd/etcd.conf.yml
+sed -i "s/$OLD_IP/$NEW_IP/g" /etc/etcd/regen.env   # if it pins ETCD_INITIAL_CLUSTER
+rm -f /etc/etcd/.regen-done-*
+
+grep -E 'initial-cluster|urls' /etc/etcd/etcd.conf.yml   # every address is the new one
+```
+
+On an image that carries the cloud-init's regen service, everything above is
+also what `systemctl restart etcd-regen-config.service` does on its own — it
+re-signs for the detected IP and re-renders the config from
+`/etc/etcd/etcd.conf.yml.j2`. It stops short of the two paths below, and refuses
+outright when `/var/lib/etcd/member` is populated and the certificate needed
+re-signing, because that combination is a host that cannot be repaired without
+someone deciding which of the two it is.
+
+### A live control plane that moved — fix the membership record
+
+The host keeps its data, so only the peer URL etcd advertises is stale.
+`initial-cluster` does not change it — that is read at bootstrap and ignored
+ever after. Start etcd and correct the record over the loopback, the one
+endpoint both the old and new certificate are valid for:
+
+```bash
+systemctl restart etcd
+
+export ETCDCTL_API=3
+export ETCDCTL_ENDPOINTS=https://127.0.0.1:2379
+export ETCDCTL_CACERT=/etc/etcd/ssl/ca.pem
+export ETCDCTL_CERT=/etc/etcd/ssl/$NODE.pem
+export ETCDCTL_KEY=/etc/etcd/ssl/$NODE-key.pem
+
+etcdctl --user "root:<root-pw>" member list        # take the member ID from here
+etcdctl --user "root:<root-pw>" member update <member-id> --peer-urls=https://$NEW_IP:2380
+systemctl restart etcd
+
+etcdctl endpoint health
+```
+
+Tenants, users, roles and the `auth enable` flag all survive — this path changes
+an address and nothing else. Skip to [then the fleet](#then-the-fleet).
+
+### A clone carrying the template's data — seal it
+
+A clone's `/var/lib/etcd` is the *template's*: a member bootstrapped under the
+template's address, holding whatever tenants, users and auth state the image was
+sealed with. Resetting it gives this host a cluster of its own, with a new
+cluster ID and nothing in it.
+
+Only ever do this to a clone that has served nothing. On a control plane with
+tenants it is not a repair — it destroys every tenant's Patroni state, every
+etcd user and role, and the `auth enable` flag, for every cluster at once.
+
+```bash
+systemctl stop etcd
+
+ls -la /root/etcd-backup-*/etcd-data 2>/dev/null    # anything kept from before?
+cp -a /var/lib/etcd /root/etcd-data-final-backup-$(date +%Y%m%d-%H%M)
+rm -rf /var/lib/etcd/*
+
+# Must be `new`: the reset re-bootstraps, and `existing` makes etcd look for a
+# cluster to join that is not there. `initial-cluster` must already name this
+# node at the NEW address — that is what the re-address above was for.
+grep -E 'initial-cluster-state|initial-cluster:' /etc/etcd/etcd.conf.yml
+
+systemctl daemon-reload
+systemctl start etcd
+systemctl status etcd --no-pager
+```
+
+`cp -a` rather than `cp -r`: the copy is only a restorable backup if it keeps
+ownership and mode (etcd will not start on a data directory it does not own —
+`chown -R etcd:etcd` if you ever put one back).
+
+An empty cluster has no root user and no RBAC, so step 8 happens again. Auth is
+off at this point, so no `--user` yet:
+
+```bash
+export ETCDCTL_API=3
+export ETCDCTL_ENDPOINTS=https://127.0.0.1:2379
+export ETCDCTL_CACERT=/etc/etcd/ssl/ca.pem
+export ETCDCTL_CERT=/etc/etcd/ssl/$NODE.pem
+export ETCDCTL_KEY=/etc/etcd/ssl/$NODE-key.pem
+
+etcdctl user add root                # prompts twice; must match CONTROL_PLANE_ETCD_ROOT_PASSWORD
+etcdctl user grant-role root root
+etcdctl auth enable
+```
+
+The middle command is not optional and not reorderable: `auth enable` refuses
+while `root` does not hold the `root` role, and the failure reads as a
+permissions error rather than a missing grant — which is why it is easy to run
+`auth enable` twice and grant in between.
+
+Then confirm the transport is the one the tenant design needs. A template built
+with `client-cert-auth: false` hands out access to anyone who can reach the
+port, and erawan's per-tenant certificates stop being an access control at all:
+
+```bash
+grep -n 'client-cert-auth' /etc/etcd/etcd.conf.yml
+sed -i 's/client-cert-auth: false/client-cert-auth: true/' /etc/etcd/etcd.conf.yml
+systemctl restart etcd
+systemctl status etcd --no-pager
+```
+
+That `sed` deliberately also rewrites `peer-client-cert-auth: false` — the
+pattern is a substring of it — and both belong on. Re-run step 7 afterwards:
+with `client-cert-auth: true` the gateway dials etcd's own listener as a client,
+so a server certificate without `clientAuth` answers every `/v3` request with
+503 from here on.
+
+Everything the old cluster held is now gone, so every tenant has to be
+provisioned onto this host again — a deploy or start/recover per cluster
+re-creates its role, user, key prefix and certificate. The certificate files
+under `/etc/etcd/ssl/erawan-clients/` survive the wipe as files, but the etcd
+users they authenticate as do not.
+
+### Then the fleet
+
+The address is in three more places, none of them on this host, and nothing
+finds them on its own:
+
+| Where | What to do |
+|---|---|
+| `SHARED_CONTROL_PLANE` in `/etc/erawan-cluster/.env` | Set it to the new IP and restart erawan. It is also the address erawan SSHes into to sign tenant certificates and run `etcdctl` |
+| Every deployed cluster's `/etc/patroni/patroni.yml` | The endpoint is baked in when the file is rendered ([`patroni.yml.j2`](../cluster/pgsql/playbooks/roles/configure_node/templates/patroni.yml.j2)), and `use_proxies: true` means Patroni will never discover the new address by itself. Re-run a deploy or start/recover per cluster to re-render it |
+| Node-side egress rules, if you filter them | The nodes now dial `2379` at the new address |
+
+Until a cluster has been re-rendered its nodes are still dialling the old
+address, which is why it stays in the certificate's SANs until the last one has
+moved. Patroni's `ttl` is 30s: a cluster that cannot reach the DCS for longer
+than that loses its leader lock and holds its primary read-only until it can.
+
 ## Rotation
 
 | What | How | Blast radius |
@@ -523,7 +740,7 @@ indexed in [pgsql.md → Symptom index](pgsql.md#symptom-index). Control-plane-s
 |---|---|
 | `curl .../v3/auth/authenticate` returns `404` | `enable-grpc-gateway` is off, or etcd did not start from the config file you edited (`systemctl cat etcd`, and check the `--config-file` override is in effect) |
 | `etcd.service` fails with `member ... has already been bootstrapped` | Leftover data in `/var/lib/etcd` from an earlier incarnation. `/var/lib/etcd/default` is the package's own auto-start and is safe to delete; `/var/lib/etcd/member` is this control plane's real state and is not |
-| The host's IP changed and etcd no longer serves | The certificate's SANs and every URL in `etcd.conf.yml` name the old address. Re-sign for the new one (step 3) and update the config; do **not** clear the data directory to make it start — recover with `etcdctl member update` or a [snapshot restore](#rolling-back-a-change-to-this-host) |
+| The host's IP changed and etcd no longer serves | The certificate's SANs, the raft membership record and every URL in `etcd.conf.yml` still name the old address. Follow [changing the control plane's private IP](#changing-the-control-planes-private-ip); do **not** clear the data directory to make it start |
 | `cfssl: command not found` | `apt install -y golang-cfssl` |
 | Provisioning warns `authentication is not enabled` | Step 8 was skipped |
 | Provisioning fails on `invalid user ID or password` for root | `CONTROL_PLANE_ETCD_ROOT_PASSWORD` does not match this host's root user |
