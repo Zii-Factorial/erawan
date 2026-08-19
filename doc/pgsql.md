@@ -367,8 +367,8 @@ else. Standing up the host — etcd, TLS material, the root user, `auth enable` 
 is yours. Erawan reaches it over SSH with the cluster's own key by default.
 
 [control-plane.md](control-plane.md) builds one step by step — etcd install, CA
-and certificate generation, the TLS config, RBAC set-up and verification, plus a
-cloud-init that does the same at boot. What follows here is the four
+and certificate generation, the TLS config, RBAC set-up, verification, and how
+to revoke a tenant or roll a change back. What follows here is the four
 requirements those steps satisfy, and what each one looks like when it is
 missing.
 

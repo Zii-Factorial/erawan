@@ -119,8 +119,9 @@ infrastructure and a later cluster of the same name would inherit them.
 The control plane itself — its etcd, TLS material, root user and `auth enable` —
 is expected to exist already. Erawan consumes it and never provisions it, which
 is why the roles fail early and by name when `/etc/etcd/ssl/*.pem` is missing or
-the root credential is wrong. `doc/control-plane.md` builds one step by step —
-by hand, or at boot from `cloudinit/etcd-control-plane.yml` in this directory.
+the root credential is wrong. `doc/control-plane.md` builds one step by step:
+etcd, the CA and server certificate, RBAC, verification, and how to revoke or
+roll any of it back.
 
 Four settings on that host are load-bearing, and none of them is visible to a
 `GET /version` check — which is served by etcd's own HTTP handler and answers

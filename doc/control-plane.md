@@ -11,12 +11,10 @@ per-tenant roles, users, key prefixes, client certificates and firewall grants �
 nothing else. Standing up etcd, its TLS material, the root user and `auth
 enable` is this document.
 
-Steps 1–9 below build one by hand, in order. Everything after them is optional:
-a [cloud-init](#doing-it-at-boot-instead-the-cloud-init) that does the same work
-at boot for a VM that gets rebuilt or cloned, and the operational notes —
-[golden images](#building-a-golden-image),
-[more members](#adding-more-control-plane-members),
-[rotation](#rotation), [troubleshooting](#troubleshooting).
+Steps 1–9 below build one, in order. After them come the operational notes:
+[rollback and revoking access](#rollback-and-revoking-access),
+[more members](#adding-more-control-plane-members), [rotation](#rotation) and
+[troubleshooting](#troubleshooting).
 
 **Run every command as root** (`sudo -i`). Most of the files live in
 `/etc/etcd/ssl`, which is not writable by a normal user, so a half-`sudo`'d
@@ -77,9 +75,9 @@ mkdir -p /etc/etcd/ssl /var/lib/etcd
 cd /etc/etcd/ssl
 ```
 
-`golang-cfssl` provides `cfssl` and `cfssljson`. `gettext-base` (for `envsubst`)
-is only used by the [cloud-init](#doing-it-at-boot-instead-the-cloud-init); it
-does no harm here.
+`golang-cfssl` provides `cfssl` and `cfssljson`, which sign everything in steps
+2 and 3. `gettext-base` is not used by any step here — it is in the line because
+the node image installs it anyway, and it does no harm.
 
 ## Step 2 — Create the CA
 
@@ -192,8 +190,8 @@ chown -R root:root /etc/etcd/ssl/erawan-clients && chmod 700 /etc/etcd/ssl/erawa
 Left as `etcd:etcd`, a compromise of the etcd service account is a compromise of
 the CA and of every tenant credential ever issued from it. Note also that
 re-running the wildcard `chown` later re-takes the `erawan-clients` directory
-for the etcd user — which is why the cloud-init sets ownership per file instead
-of sweeping the directory.
+for the etcd user, so once tenants exist on this host, set ownership per file
+rather than sweeping the directory.
 
 ## Step 5 — Write `/etc/etcd/etcd.conf.yml`
 
@@ -361,76 +359,114 @@ Existing clusters are never migrated: each job records the DCS layout it was
 deployed with, so setting this variable cannot re-point a cluster that is
 already running its own etcd.
 
-## Doing it at boot instead — the cloud-init
+## Rollback and revoking access
 
-[`cluster/shared/cloudinit/etcd-control-plane.yml`](../cluster/shared/cloudinit/etcd-control-plane.yml)
-performs steps 1, 3, 5 and 6 automatically, against **the IP the VM actually
-boots with**. That is the difference that matters on a platform where a rebuilt
-or cloned VM comes back on a different address: the certificate from step 3 is
-pinned to an IP, so a hand-built host stops serving the moment its address
-changes, while a cloud-init host re-signs itself and comes up.
+Three different things get rolled back here, and they are not interchangeable:
+a tenant's access, one node's access, and a change to the control plane itself.
 
-It cannot do step 2. A host that mints its own CA on boot would orphan every
-certificate already issued to a running tenant, so the CA must be there first —
-either baked into the image (the intended flow, see
-[golden images](#building-a-golden-image)) or copied in afterwards:
+### Revoking one tenant
 
-```bash
-scp ca.pem ca-key.pem ca-config.json root@<vm>:/etc/etcd/ssl/
-ssh root@<vm> systemctl restart etcd-regen-config.service
+```
+DELETE /cluster/pgsql/dcs      body: {"job_id": "<job>"}
 ```
 
-The first boot's failure on a missing CA is expected on that path and does not
-fail the rest of cloud-init.
+This runs `control_plane_dcs_cleanup.yml` against the control plane **alone**,
+so it still works after the tenant's VMs are destroyed. For that cluster it
+removes:
 
-**Do not paste the CA key into the user-data.** `write_files` with a base64 key
-works, but user-data is readable from the instance metadata service by anything
-running on the VM and is usually retained by the hypervisor — that is the CA for
-every tenant certificate on the platform.
+- every key under `/db/patroni/<cluster>/`,
+- the etcd user `patroni-<cluster>-user` and role `patroni-<cluster>-role`,
+- every certificate pair matching `<cluster>-user-*` in
+  `/etc/etcd/ssl/erawan-clients/<engine>/`, and
+- the UFW grants on `2379` for that cluster's node addresses.
 
-What `/usr/local/sbin/etcd-regen-config.sh` does on each boot:
+Nothing else releases them. The objects are named after the cluster, so leaving
+them behind accumulates state on shared infrastructure — and a later cluster of
+the same name inherits a password and a certificate issued to machines that no
+longer exist.
 
-1. detects the private IP (`ip route get 1.1.1.1`),
-2. signs `/etc/etcd/ssl/<name>.pem` for it with `-profile=server`, carrying SANs
-   for the node name, that IP, `127.0.0.1` and `localhost` (plus any the
-   previous certificate had),
-3. renders `/etc/etcd/etcd.conf.yml` from `/etc/etcd/etcd.conf.yml.j2`,
-4. removes the package's `/var/lib/etcd/default`, and
-5. starts etcd.
+It takes effect immediately: the cluster loses its DCS, Patroni loses its leader
+lock, and every node goes read-only. This is a decommissioning step, not a way
+to pause a cluster.
 
-It logs to `/var/log/etcd-regen-config.log`, skips its work on a reboot at an
-address it has already configured (`/etc/etcd/.regen-done-<ip>`), and is
-re-runnable with `systemctl restart etcd-regen-config.service`. Node name,
-cluster membership and token come from `/etc/etcd/regen.env`; the defaults are
-the hostname and a single-member cluster.
+By hand, if erawan cannot reach the host (same `ETCDCTL_*` environment as step 8):
 
-The one thing it will not do is delete a bootstrapped `/var/lib/etcd/member` to
-make a new address work — see [troubleshooting](#troubleshooting).
+```bash
+etcdctl --user "root:<root-pw>" del --prefix /db/patroni/<cluster>/
+etcdctl --user "root:<root-pw>" user delete patroni-<cluster>-user
+etcdctl --user "root:<root-pw>" role delete patroni-<cluster>-role
+rm -f /etc/etcd/ssl/erawan-clients/pgsql/<cluster>-user-*
+ufw delete allow from <node-ip> to any port 2379 proto tcp
+```
 
-A CA can also be created on such a VM with `/usr/local/sbin/etcd-make-ca.sh`,
-which runs step 2 exactly as written above and refuses to overwrite an existing
-CA. It is never called at boot.
+### Revoking one node
 
-## Building a golden image
+Removing a member passes the departing address to the provisioning run as
+`dcs_revoke_ips`, which drops its UFW grant on `2379`. The tenant's user, role
+and keys stay — the remaining nodes still need them — and a node rebuilt by a
+scale operation is granted again on the next provisioning run, so neither needs
+doing by hand.
 
-The regen script refuses to delete bootstrapped etcd data, so a template must
-not carry any. Before snapshotting:
+What this does **not** do is invalidate the certificate that node still holds on
+disk. It is the tenant's certificate, shared by every node of the cluster, so
+withdrawing it means [rotating](#rotation) it for the whole tenant. Destroy the
+VM, or rotate if the disk left your control.
+
+### Rolling back a change to this host
+
+etcd reads its config and certificates only at start, so rolling back a change
+is: put the old file back, restart. That only works if the old file still
+exists — and `cfssl … | cfssljson -bare cp-etcd-01` overwrites a certificate
+pair in place, with no backup. Before editing or re-signing:
+
+```bash
+cp -a /etc/etcd/etcd.conf.yml /etc/etcd/etcd.conf.yml.$(date +%Y%m%dT%H%M%S)
+cp -a /etc/etcd/ssl/cp-etcd-01.pem     /etc/etcd/ssl/cp-etcd-01.pem.bak
+cp -a /etc/etcd/ssl/cp-etcd-01-key.pem /etc/etcd/ssl/cp-etcd-01-key.pem.bak
+```
+
+A bad certificate is then one `cp` and one `systemctl restart etcd` away from
+being undone, instead of a re-sign under pressure with every tenant down.
+
+Data is a separate rollback. Take a snapshot before anything that touches
+membership or the data directory:
+
+```bash
+etcdctl --user "root:<root-pw>" snapshot save /var/backups/etcd-$(date +%F).db
+```
+
+Restoring is deliberate and offline — it rebuilds the data directory, and every
+tenant's state goes back to the moment of the snapshot:
 
 ```bash
 systemctl stop etcd
-rm -rf /var/lib/etcd/*
-rm -f /etc/etcd/.regen-done-* /etc/etcd/etcd.conf.yml
-rm -f /etc/etcd/ssl/cp-etcd-01.pem /etc/etcd/ssl/cp-etcd-01-key.pem
-: > /var/log/etcd-regen-config.log
+etcdctl snapshot restore /var/backups/etcd-2026-08-19.db   --name cp-etcd-01   --initial-cluster cp-etcd-01=https://10.10.3.66:2380   --initial-advertise-peer-urls https://10.10.3.66:2380   --data-dir /var/lib/etcd.restored
+mv /var/lib/etcd /var/lib/etcd.broken
+mv /var/lib/etcd.restored /var/lib/etcd
+chown -R etcd:etcd /var/lib/etcd
+systemctl start etcd
 ```
 
-Keep `ca.pem`, `ca-key.pem` and `ca-config.json` — inheriting the CA is the
-point of the image. Every clone then signs itself a fresh certificate for its
-own address on first boot.
+(On etcd 3.5 and later `snapshot restore` moved to `etcdutl`; on the 3.4 line
+this guide targets it is still `etcdctl`.) Patroni rebuilds its own keys within
+a few loop intervals, but RBAC comes back as the snapshot had it: a tenant
+provisioned after the snapshot is simply missing, and heals on its next deploy,
+start/recover or add-member. What is never a repair is deleting
+`/var/lib/etcd/member` — that is not a rollback, it is the whole control plane.
 
-If the image carries tenant material (it should not), clear
-`/etc/etcd/ssl/erawan-clients/` too: those are live credentials for clusters
-belonging to the machine you cloned.
+### Turning the shared control plane off
+
+Comment out `SHARED_CONTROL_PLANE` and `CONTROL_PLANE_ETCD_ROOT_PASSWORD` in
+`/etc/erawan-cluster/.env` and restart the service, and **new** PostgreSQL
+clusters go back to a per-node etcd quorum.
+
+Do this only once no cluster is deployed against the control plane. A cluster's
+stored spec records that its DCS is here, but the runner needs both that flag
+*and* a configured control plane
+([`usesControlPlane`](../internal/cluster/pgsql/runner.go)) — with the variable
+gone, the next deploy or start/recover for such a cluster renders its
+`patroni.yml` in classic mode, pointing Patroni at a local etcd its nodes do not
+run. Decommission or redeploy those clusters first, then retire the host.
 
 ## Adding more control-plane members
 
@@ -443,14 +479,16 @@ etcdctl --user "root:<root-pw>" member add cp-etcd-02 \
   --peer-urls=https://10.10.3.67:2380
 ```
 
-Then, on the new VM — in `/etc/etcd/regen.env` before its first regen run, or
-directly in its `etcd.conf.yml` if you are building it by hand:
+Build the new host through steps 1–6, copying the CA in at step 2 rather than
+creating one, and give its `etcd.conf.yml` the whole membership and
+`initial-cluster-state: existing` — a second member that bootstraps as `new`
+forms its own one-member cluster instead of joining:
 
-```bash
-ETCD_NODE_NAME=cp-etcd-02
-ETCD_INITIAL_CLUSTER=cp-etcd-01=https://10.10.3.66:2380,cp-etcd-02=https://10.10.3.67:2380
-ETCD_CLUSTER_STATE=existing
-ETCD_CLUSTER_TOKEN=erawan-shared-cp
+```yaml
+name: cp-etcd-02
+initial-cluster: cp-etcd-01=https://10.10.3.66:2380,cp-etcd-02=https://10.10.3.67:2380
+initial-cluster-state: existing
+initial-cluster-token: erawan-shared-cp
 ```
 
 Two limits worth knowing before you build three of these:
@@ -470,7 +508,7 @@ Two limits worth knowing before you build three of these:
 |---|---|---|
 | One tenant's certificate | Delete the pair under `/etc/etcd/ssl/erawan-clients/<engine>/` and re-run any deploy, start/recover or add-member for that cluster. The next run mints a new pair (stamped with the issue time) and installs it | That tenant |
 | One tenant's password | Rotate on the erawan side; provisioning converges the etcd user's password on the next run | That tenant |
-| Server certificate | Re-sign (step 3) and `systemctl restart etcd` — or, on a cloud-init host, delete `/etc/etcd/ssl/<name>.pem`, `-key.pem` and `/etc/etcd/.regen-done-*` and restart `etcd-regen-config.service` | etcd restarts — a few seconds of DCS outage for every tenant. Patroni's `ttl` is 30s, so time it deliberately |
+| Server certificate | Back up the old pair, re-sign (step 3), `systemctl restart etcd` | etcd restarts — a few seconds of DCS outage for every tenant. Patroni's `ttl` is 30s, so time it deliberately |
 | CA | Effectively a rebuild: every server and tenant certificate signed by it stops being trusted, and nodes hold the old `ca.pem` until their next provisioning run | Everything |
 
 Any change to `/etc/etcd/etcd.conf.yml` also needs an etcd restart, with the
@@ -484,15 +522,14 @@ indexed in [pgsql.md → Symptom index](pgsql.md#symptom-index). Control-plane-s
 | Seen on the control plane | Cause |
 |---|---|
 | `curl .../v3/auth/authenticate` returns `404` | `enable-grpc-gateway` is off, or etcd did not start from the config file you edited (`systemctl cat etcd`, and check the `--config-file` override is in effect) |
-| `etcd.service` fails with `member ... has already been bootstrapped` | Leftover data in `/var/lib/etcd` from another incarnation — the package's auto-start (`/var/lib/etcd/default`, safe to delete) or a cloned image (see below) |
-| `etcd-regen-config.service` failed, log says `CA files ... not found` | The CA is not on the VM yet — copy it in and restart the service |
-| Log says `/var/lib/etcd/member exists, but this node's certificate had to be re-signed` | Either a clone of an unsealed image (seal it: [above](#building-a-golden-image), then restart the service), or a live control plane whose IP changed — in which case do **not** wipe: restore the old address, or recover deliberately with `etcdctl member update` or a snapshot restore |
+| `etcd.service` fails with `member ... has already been bootstrapped` | Leftover data in `/var/lib/etcd` from an earlier incarnation. `/var/lib/etcd/default` is the package's own auto-start and is safe to delete; `/var/lib/etcd/member` is this control plane's real state and is not |
+| The host's IP changed and etcd no longer serves | The certificate's SANs and every URL in `etcd.conf.yml` name the old address. Re-sign for the new one (step 3) and update the config; do **not** clear the data directory to make it start — recover with `etcdctl member update` or a [snapshot restore](#rolling-back-a-change-to-this-host) |
 | `cfssl: command not found` | `apt install -y golang-cfssl` |
 | Provisioning warns `authentication is not enabled` | Step 8 was skipped |
 | Provisioning fails on `invalid user ID or password` for root | `CONTROL_PLANE_ETCD_ROOT_PASSWORD` does not match this host's root user |
 | Nodes fail with `certificate verify failed` / IP mismatch | The server certificate has no SAN for the address the node dials — re-sign (step 3) |
 
-Useful reads: `journalctl -u etcd -n 100`, `systemctl cat etcd`,
-`/var/log/etcd-regen-config.log`, and
+Useful reads: `journalctl -u etcd -n 100`, `systemctl cat etcd` (confirms the
+`--config-file` override is in effect), and
 `etcdctl --user "root:<pw>" user list` / `role list` for what erawan has
 provisioned.
