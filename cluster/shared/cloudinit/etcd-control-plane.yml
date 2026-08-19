@@ -1,0 +1,361 @@
+#cloud-config
+# Shared control-plane etcd — self-configuring cloud-init.
+#
+# Builds the host doc/control-plane.md describes: one etcd that every tenant's
+# Patroni borrows its quorum from, reached over the gRPC JSON gateway with TLS
+# client-cert auth and prefix-scoped RBAC.
+#
+# Self-sufficient by design: the private IP is detected at boot, the server
+# certificate is re-signed for it, /etc/etcd/etcd.conf.yml is rendered from that
+# and etcd is (re)started. A VM cloned from a golden image therefore comes up
+# correctly on whatever address it is given, with nothing to edit by hand.
+#
+# REQUIRES ca.pem, ca-key.pem and ca-config.json to already exist in
+# /etc/etcd/ssl — erawan never provisions a CA, and neither does this file. See
+# doc/control-plane.md step 1 for generating them, and step 3 for the two ways
+# of getting them onto the VM (baked into the image, or copied in after the
+# first boot).
+
+package_update: true
+
+packages:
+  - etcd-server
+  - etcd-client
+  - golang-cfssl
+  - gettext-base
+  - curl
+  - jq
+
+write_files:
+  # The packaged unit starts etcd from /etc/default/etcd with a flags-and-env
+  # configuration. Everything below is driven by a config file instead, and a
+  # config file wins outright — etcd ignores flags and environment when
+  # --config-file is given — so the env the package sets is cleared here to
+  # keep the two from reading as if they both applied.
+  - path: /etc/systemd/system/etcd.service.d/override.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Service]
+      Environment=
+      ExecStart=
+      ExecStart=/usr/bin/etcd --config-file=/etc/etcd/etcd.conf.yml
+
+  - path: /etc/etcd/etcd.conf.yml.j2
+    permissions: "0644"
+    owner: root:root
+    content: |
+      name: ${ETCD_NODE_NAME}
+      data-dir: /var/lib/etcd
+
+      listen-peer-urls: https://${ETCD_SELF_IP}:2380
+      # The loopback entry is what the gRPC JSON gateway dials when it proxies
+      # an inbound HTTP request to etcd's own gRPC listener. Keep it.
+      listen-client-urls: https://${ETCD_SELF_IP}:2379,https://127.0.0.1:2379
+
+      initial-advertise-peer-urls: https://${ETCD_SELF_IP}:2380
+      advertise-client-urls: https://${ETCD_SELF_IP}:2379
+
+      initial-cluster: ${ETCD_INITIAL_CLUSTER}
+      initial-cluster-state: ${ETCD_CLUSTER_STATE}
+      initial-cluster-token: ${ETCD_CLUSTER_TOKEN}
+
+      # Load-bearing, and NOT the default here: etcd defaults this to true for
+      # command-line flags but false when started with --config-file. Patroni
+      # speaks etcd v3 over HTTP (POST /v3/...), which exists only when the
+      # gateway is on — with it off, /version and etcdctl still work, so the
+      # host looks healthy right up until every tenant fails.
+      enable-grpc-gateway: true
+
+      client-transport-security:
+        cert-file: /etc/etcd/ssl/${ETCD_NODE_NAME}.pem
+        key-file: /etc/etcd/ssl/${ETCD_NODE_NAME}-key.pem
+        trusted-ca-file: /etc/etcd/ssl/ca.pem
+        client-cert-auth: true
+
+      peer-transport-security:
+        cert-file: /etc/etcd/ssl/${ETCD_NODE_NAME}.pem
+        key-file: /etc/etcd/ssl/${ETCD_NODE_NAME}-key.pem
+        trusted-ca-file: /etc/etcd/ssl/ca.pem
+        peer-client-cert-auth: true
+
+  - path: /etc/etcd/regen.env
+    permissions: "0644"
+    owner: root:root
+    content: |
+      # Defaults, applied when this file leaves them unset:
+      #   ETCD_NODE_NAME        the hostname
+      #   ETCD_INITIAL_CLUSTER  <name>=https://<detected IP>:2380  (single node)
+      #   ETCD_CLUSTER_STATE    new
+      #   ETCD_CLUSTER_TOKEN    erawan-shared-cp
+      #
+      # The node name also names the certificate erawan reads on this host, so
+      # CONTROL_PLANE_ETCD_CERT / _KEY must match it — they default to
+      # cp-etcd-01.pem, which is what the hostname should be unless you set
+      # both sides.
+      #
+      # Second and subsequent members: run `etcdctl member add` on the existing
+      # cluster FIRST, then set these before the new VM boots.
+      # ETCD_NODE_NAME=cp-etcd-02
+      # ETCD_INITIAL_CLUSTER=cp-etcd-01=https://10.10.3.66:2380,cp-etcd-02=https://10.10.3.67:2380
+      # ETCD_CLUSTER_STATE=existing
+      # ETCD_CLUSTER_TOKEN=erawan-shared-cp
+
+  # Operator-run, never called from this cloud-init: a CA created behind your
+  # back on a host that was supposed to inherit one would silently orphan every
+  # certificate already issued. Refuses to overwrite an existing CA.
+  - path: /usr/local/sbin/etcd-make-ca.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      # Creates the control plane's CA and signing profile in /etc/etcd/ssl.
+      # Run this once, on the first control plane; copy the three files it
+      # writes to every other one. See doc/control-plane.md step 1.
+      set -euo pipefail
+
+      SSL_DIR=${SSL_DIR:-/etc/etcd/ssl}
+      CA_ORG=${CA_ORG:-erawan}
+      CA_CN=${CA_CN:-erawan-etcd-ca}
+
+      mkdir -p "$SSL_DIR"
+      for f in ca.pem ca-key.pem ca-config.json; do
+        if [[ -e "${SSL_DIR}/${f}" ]]; then
+          echo "ERROR: ${SSL_DIR}/${f} already exists - refusing to replace this CA."
+          echo "       Re-issuing it invalidates every server and tenant certificate signed by it."
+          exit 1
+        fi
+      done
+
+      command -v cfssl >/dev/null || { echo "ERROR: cfssl not installed (apt-get install -y golang-cfssl)"; exit 1; }
+
+      # 'client auth' in the server profile is not a copy-paste slip. Under
+      # client-cert-auth the gateway connects to etcd's own gRPC listener as a
+      # client, presenting this same certificate — without clientAuth every
+      # /v3 request answers 503 'tls: bad certificate'.
+      cat > "${SSL_DIR}/ca-config.json" <<'JSON'
+      {
+        "signing": {
+          "default": { "expiry": "87600h" },
+          "profiles": {
+            "server": {
+              "expiry": "87600h",
+              "usages": ["signing", "key encipherment", "server auth", "client auth"]
+            }
+          }
+        }
+      }
+      JSON
+
+      cat > /tmp/ca-csr.json <<JSON
+      {
+        "CN": "${CA_CN}",
+        "key": { "algo": "rsa", "size": 2048 },
+        "names": [ { "O": "${CA_ORG}" } ],
+        "ca": { "expiry": "175200h" }
+      }
+      JSON
+
+      ( cd "$SSL_DIR" && cfssl gencert -initca /tmp/ca-csr.json | cfssljson -bare ca )
+      rm -f /tmp/ca-csr.json "${SSL_DIR}/ca.csr"
+
+      chown root:root "${SSL_DIR}/ca-key.pem"
+      chmod 600 "${SSL_DIR}/ca-key.pem"
+      chmod 644 "${SSL_DIR}/ca.pem" "${SSL_DIR}/ca-config.json"
+
+      echo "CA written to ${SSL_DIR}: ca.pem, ca-key.pem, ca-config.json"
+      echo "Run: systemctl restart etcd-regen-config.service   # signs this node and starts etcd"
+
+  - path: /usr/local/sbin/etcd-regen-config.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      LOG=/var/log/etcd-regen-config.log
+      exec > >(tee -a "$LOG") 2>&1
+      echo "== etcd-regen-config: $(date) =="
+
+      SSL_DIR=/etc/etcd/ssl
+      DATA_DIR=/var/lib/etcd
+      CONF=/etc/etcd/etcd.conf.yml
+      TEMPLATE=/etc/etcd/etcd.conf.yml.j2
+      ENV_FILE=/etc/etcd/regen.env
+
+      mkdir -p "$SSL_DIR" "$DATA_DIR"
+      id etcd &>/dev/null || { echo "ERROR: user 'etcd' not found - etcd-server package may not be installed"; exit 1; }
+
+      # etcd reads the CA and its own key pair, so the directory is traversable
+      # by its group. The CA private key and the per-tenant client keys erawan
+      # mints under erawan-clients/ stay root-only: handing those to the etcd
+      # service account would make a compromise of etcd a compromise of the CA
+      # and of every tenant credential ever issued from it.
+      chown root:etcd "$SSL_DIR"
+      chmod 750 "$SSL_DIR"
+      chown etcd:etcd "$DATA_DIR"
+      chmod 700 "$DATA_DIR"
+
+      if [[ ! -f "${SSL_DIR}/ca.pem" || ! -f "${SSL_DIR}/ca-key.pem" || ! -f "${SSL_DIR}/ca-config.json" ]]; then
+        echo "ERROR: CA files (ca.pem, ca-key.pem, ca-config.json) not found in ${SSL_DIR}"
+        echo "       Copy them in from the first control plane, or create them here with"
+        echo "       /usr/local/sbin/etcd-make-ca.sh, then re-run:"
+        echo "         systemctl restart etcd-regen-config.service"
+        exit 1
+      fi
+
+      chown root:etcd "${SSL_DIR}/ca.pem"
+      chmod 640 "${SSL_DIR}/ca.pem"
+      chown root:root "${SSL_DIR}/ca-key.pem"
+      chmod 600 "${SSL_DIR}/ca-key.pem"
+      if [[ -d "${SSL_DIR}/erawan-clients" ]]; then
+        chown -R root:root "${SSL_DIR}/erawan-clients"
+        chmod 700 "${SSL_DIR}/erawan-clients"
+      fi
+
+      [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+
+      NODE_NAME="${ETCD_NODE_NAME:-$(hostname)}"
+
+      SELF_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+      if [[ -z "$SELF_IP" ]]; then
+        echo "ERROR: could not detect private IP (network not up?)"
+        exit 1
+      fi
+      echo "Node: ${NODE_NAME} | Detected IP: ${SELF_IP}"
+
+      MARKER="/etc/etcd/.regen-done-${SELF_IP}"
+      if [[ -f "$MARKER" && -f "$CONF" && -f "${SSL_DIR}/${NODE_NAME}.pem" ]]; then
+        echo "IP ${SELF_IP} already configured (marker + config + cert exist) - skipping"
+        systemctl is-active --quiet etcd || systemctl restart --no-block etcd
+        exit 0
+      fi
+
+      NEED_RESIGN=true
+      if [[ -f "${SSL_DIR}/${NODE_NAME}.pem" ]]; then
+        if openssl x509 -in "${SSL_DIR}/${NODE_NAME}.pem" -noout -ext subjectAltName 2>/dev/null | grep -q "$SELF_IP"; then
+          echo "Cert already has SAN=${SELF_IP} - skipping re-sign"
+          NEED_RESIGN=false
+        fi
+      fi
+
+      if [[ "$NEED_RESIGN" == "true" ]]; then
+        echo "Re-signing cert for ${NODE_NAME} @ ${SELF_IP} ..."
+
+        # Carry the old SANs forward so a host that has moved address twice is
+        # still reachable under names another node may still hold.
+        OLD_SANS=""
+        if [[ -f "${SSL_DIR}/${NODE_NAME}.pem" ]]; then
+          OLD_SANS=$(openssl x509 -in "${SSL_DIR}/${NODE_NAME}.pem" -noout -ext subjectAltName 2>/dev/null \
+            | tr ',' '\n' | grep -oE '(IP Address|DNS):[^ ]+' | cut -d: -f2 | tr '\n' ' ')
+        fi
+
+        HOSTS_JSON="[\"${NODE_NAME}\", \"${SELF_IP}\", \"127.0.0.1\", \"localhost\""
+        for h in $OLD_SANS; do
+          [[ "$h" == "$SELF_IP" ]] && continue
+          HOSTS_JSON="${HOSTS_JSON}, \"${h}\""
+        done
+        HOSTS_JSON="${HOSTS_JSON}]"
+
+        cat > "/tmp/${NODE_NAME}-csr.json" <<EOF
+      {
+        "CN": "${NODE_NAME}",
+        "hosts": ${HOSTS_JSON},
+        "key": {"algo": "rsa", "size": 2048}
+      }
+      EOF
+
+        # -profile=server must resolve to a profile carrying BOTH server auth
+        # and client auth (see etcd-make-ca.sh) - the gateway presents this
+        # certificate to etcd's own gRPC listener.
+        cfssl gencert -ca="${SSL_DIR}/ca.pem" -ca-key="${SSL_DIR}/ca-key.pem" \
+          -config="${SSL_DIR}/ca-config.json" -profile=server \
+          "/tmp/${NODE_NAME}-csr.json" | cfssljson -bare "${SSL_DIR}/${NODE_NAME}"
+
+        chown root:etcd "${SSL_DIR}/${NODE_NAME}.pem" "${SSL_DIR}/${NODE_NAME}-key.pem"
+        chmod 644 "${SSL_DIR}/${NODE_NAME}.pem"
+        chmod 640 "${SSL_DIR}/${NODE_NAME}-key.pem"
+        rm -f "/tmp/${NODE_NAME}-csr.json" "${SSL_DIR}/${NODE_NAME}.csr"
+      fi
+
+      export ETCD_NODE_NAME="$NODE_NAME"
+      export ETCD_SELF_IP="$SELF_IP"
+      export ETCD_INITIAL_CLUSTER="${ETCD_INITIAL_CLUSTER:-${NODE_NAME}=https://${SELF_IP}:2380}"
+      export ETCD_CLUSTER_STATE="${ETCD_CLUSTER_STATE:-new}"
+      export ETCD_CLUSTER_TOKEN="${ETCD_CLUSTER_TOKEN:-erawan-shared-cp}"
+
+      if [[ ! -f "$TEMPLATE" ]]; then
+        echo "ERROR: ${TEMPLATE} not found"
+        exit 1
+      fi
+      envsubst < "$TEMPLATE" > "$CONF"
+      chown root:etcd "$CONF"
+      chmod 640 "$CONF"
+      echo "Rendered ${CONF}:"
+      cat "$CONF"
+
+      # Installing etcd-server auto-starts it once with the packaged defaults,
+      # which leaves a member directory at ${DATA_DIR}/default. The rendered
+      # config keeps this node's real state in ${DATA_DIR}/member instead, so
+      # that directory is never anything but junk from the install.
+      rm -rf "${DATA_DIR:?}/default"
+
+      # Bootstrapped state plus a certificate that had to be re-signed means
+      # this host holds a member that was admitted under a different address.
+      # Deleting it is not a repair: it destroys every tenant's Patroni state,
+      # every etcd user and role, and the auth-enable flag, for every cluster
+      # on this control plane at once. Fail loudly instead and let a human pick.
+      if [[ "$NEED_RESIGN" == "true" && -d "${DATA_DIR}/member" ]]; then
+        echo "ERROR: ${DATA_DIR}/member exists, but this node's certificate had to be"
+        echo "       re-signed for a new address (${SELF_IP}) - the data belongs to a member"
+        echo "       bootstrapped under a different one. Refusing to start etcd."
+        echo ""
+        echo "  Cloned from a golden image? That data is the image's, not yours. Seal it:"
+        echo "      systemctl stop etcd && rm -rf /var/lib/etcd/* && rm -f /etc/etcd/.regen-done-*"
+        echo "    then re-run: systemctl restart etcd-regen-config.service"
+        echo ""
+        echo "  A live control plane whose IP changed? Do NOT wipe it. Restore the old"
+        echo "    address, or recover deliberately (etcdctl member update, or restore from"
+        echo "    an etcdctl snapshot). See doc/control-plane.md."
+        exit 1
+      fi
+
+      touch "$MARKER"
+      systemctl daemon-reload
+      systemctl enable etcd
+      # --no-block on purpose: this unit is ordered Before=etcd.service, so a
+      # blocking restart would wait on a job that is itself waiting on this
+      # unit to finish, and only unwedge at TimeoutStartSec.
+      systemctl restart --no-block etcd
+      echo "== done - etcd (re)start queued; check: systemctl status etcd =="
+
+  - path: /etc/systemd/system/etcd-regen-config.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Regenerate etcd cert and config to match current private IP
+      Before=etcd.service
+      After=network-online.target cloud-init.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/etcd-regen-config.sh
+      RemainAfterExit=true
+      TimeoutStartSec=120
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # The package start-up used the wrong config; stop it before the real one is
+  # rendered. etcd-regen-config re-enables etcd once it has a config to start.
+  - systemctl stop etcd || true
+  - systemctl disable etcd || true
+  - systemctl daemon-reload
+  - systemctl enable etcd-regen-config.service
+  # Exits non-zero when the CA is not on the image yet - expected on that path,
+  # so it must not fail the whole cloud-init run. Copy the CA in and re-run.
+  - systemctl restart etcd-regen-config.service || true
+  - cat /var/log/etcd-regen-config.log || true
