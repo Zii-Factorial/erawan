@@ -44,6 +44,7 @@
 See [doc/api.md](doc/api.md) for the full API reference.  
 See [doc/proxy-architecture.md](doc/proxy-architecture.md) for the system design.  
 See [doc/mysql.md](doc/mysql.md) and [doc/pgsql.md](doc/pgsql.md) for cluster detail.  
+See [doc/control-plane.md](doc/control-plane.md) to stand up the shared control-plane etcd (`SHARED_CONTROL_PLANE`).  
 See [doc/security.md](doc/security.md) for the security posture and hardening knobs.  
 See [doc/adding-an-engine.md](doc/adding-an-engine.md) to add a new database engine.
 

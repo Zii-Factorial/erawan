@@ -119,7 +119,8 @@ infrastructure and a later cluster of the same name would inherit them.
 The control plane itself — its etcd, TLS material, root user and `auth enable` —
 is expected to exist already. Erawan consumes it and never provisions it, which
 is why the roles fail early and by name when `/etc/etcd/ssl/*.pem` is missing or
-the root credential is wrong.
+the root credential is wrong. `doc/control-plane.md` builds one step by step,
+from `cloudinit/etcd-control-plane.yml` in this directory.
 
 Four settings on that host are load-bearing, and none of them is visible to a
 `GET /version` check — which is served by etcd's own HTTP handler and answers
@@ -140,7 +141,7 @@ even when the API the engines use is entirely unavailable:
 
 `etcd_dcs_client` probes for all four from each node and fails the run with the
 cause named. `doc/pgsql.md` carries a reference config, the verification command
-and a symptom index.
+and a symptom index; `doc/control-plane.md` carries the build procedure.
 
 ## Wiring a new engine
 
