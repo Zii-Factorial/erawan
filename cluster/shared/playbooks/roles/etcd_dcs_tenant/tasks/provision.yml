@@ -1,0 +1,346 @@
+---
+# Creates (or converges) one tenant on the shared control-plane etcd:
+#
+#   role  patroni-<scope>-role  readwrite on prefix <namespace><scope>/
+#   user  patroni-<scope>-user  granted that role, nothing else
+#
+# etcd RBAC is prefix-based, so this is what keeps tenants off each other's
+# keys on a control plane they all share. Everything is idempotent: a redeploy,
+# a resume, a start/recover or an add-member all run this again and converge
+# instead of failing on "already exists".
+
+# One shell block rather than a task per etcdctl call: every one of them needs
+# the same no_log treatment (the root credential rides in the environment), and
+# a single block keeps the failure output — surfaced by the next task — in one
+# readable place instead of censored module results.
+- name: Provision the tenant role, user and key prefix on the control plane
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    # Also the authentication gate: a wrong root password, an unreachable
+    # endpoint or a cert mismatch fails here, before anything is mutated.
+    roles="$({{ dcs_etcdctl_bin }} role list)"
+    users="$({{ dcs_etcdctl_bin }} user list)"
+
+    if ! printf '%s\n' "$roles" | grep -Fxq "$DCS_ROLE"; then
+      {{ dcs_etcdctl_bin }} role add "$DCS_ROLE" >/dev/null
+      echo "role-created $DCS_ROLE"
+    fi
+
+    # Re-granting an identical permission is a no-op in etcd, so this runs
+    # unconditionally and repairs a role whose grant was lost or never applied.
+    {{ dcs_etcdctl_bin }} role grant-permission --prefix=true \
+      "$DCS_ROLE" readwrite "$DCS_PREFIX" >/dev/null
+
+    if printf '%s\n' "$users" | grep -Fxq "$DCS_USER"; then
+      # Converge the password to the one this job holds. Without it a cluster
+      # whose secret was regenerated (or a tenant name reused after an
+      # incomplete cleanup) would leave Patroni authenticating with a
+      # credential the control plane no longer accepts.
+      printf '%s\n' "$DCS_PASSWORD" \
+        | {{ dcs_etcdctl_bin }} user passwd --interactive=false "$DCS_USER" >/dev/null
+    else
+      printf '%s\n' "$DCS_PASSWORD" \
+        | {{ dcs_etcdctl_bin }} user add --interactive=false "$DCS_USER" >/dev/null
+      echo "user-created $DCS_USER"
+    fi
+
+    {{ dcs_etcdctl_bin }} user grant-role "$DCS_USER" "$DCS_ROLE" >/dev/null
+
+    # Prove the credential Patroni is about to be handed actually works, and
+    # that it can write inside its own prefix — a failure here means a broken
+    # cluster later, so it belongs in this step, not in a Patroni journal.
+    ETCDCTL_USER="$DCS_USER:$DCS_PASSWORD" \
+      {{ dcs_etcdctl_bin }} put "${DCS_PREFIX}erawan-preflight" ok >/dev/null
+    ETCDCTL_USER="$DCS_USER:$DCS_PASSWORD" \
+      {{ dcs_etcdctl_bin }} del "${DCS_PREFIX}erawan-preflight" >/dev/null
+
+    echo "ok $DCS_PREFIX"
+  args:
+    executable: /bin/bash
+  environment: "{{ dcs_etcdctl_env }}"
+  register: _dcs_provision
+  changed_when: "'-created ' in (_dcs_provision.stdout | default(''))"
+  failed_when: false
+  no_log: true
+
+# no_log above censors the module result, so the failure is re-raised here from
+# stdout/stderr alone — neither ever carries the password.
+- name: Fail with the control-plane etcd error
+  ansible.builtin.fail:
+    msg: |
+      Provisioning the tenant namespace {{ dcs_prefix }} on the shared
+      control-plane etcd ({{ dcs_endpoint_ip }}:{{ dcs_client_port }}) failed.
+      Check that the control plane is up, that CONTROL_PLANE_ETCD_ROOT_PASSWORD
+      matches its root user, and that auth is enabled on it.
+      etcdctl stderr: {{ _dcs_provision.stderr | default('(none)') | trim }}
+      etcdctl stdout: {{ _dcs_provision.stdout | default('(none)') | trim }}
+  when: (_dcs_provision.rc | default(1)) != 0
+
+# ── Per-tenant client certificate ───────────────────────────────────────────
+# Required by an etcd running with client-cert-auth: true, which rejects the
+# TLS handshake outright when the client presents no certificate — the failure
+# surfaces on the node as "tlsv13 alert certificate required", before any
+# username/password is ever exchanged.
+#
+# The certificate carries NO CommonName, and that is load-bearing. When
+# client-cert-auth and RBAC auth are both on, etcd rejects every request that
+# reaches its gRPC JSON gateway bearing a client certificate with a CN:
+#
+#   HTTP 400 CommonName of client sending a request against gateway will be
+#            ignored and not used as expected        (etcd embed/serve.go)
+#
+# Patroni reaches the DCS only over that gateway, so a CN here breaks the whole
+# cluster rather than one call. The tenant is identified by its RBAC username
+# and password instead — a CN would have been a second, redundant identity that
+# etcd cannot convey across the gateway anyway.
+- name: Check the CA key needed to sign tenant client certificates
+  ansible.builtin.stat:
+    path: "{{ dcs_ca_key_file }}"
+  register: _dcs_ca_key_stat
+  when: dcs_client_cert_enabled | bool
+
+- name: Fail when the CA key is missing
+  ansible.builtin.fail:
+    msg: >-
+      {{ dcs_ca_key_file }} does not exist on the control plane, so a client
+      certificate cannot be signed for {{ dcs_tenant_user }}. Either place the
+      CA key there (CONTROL_PLANE_ETCD_CA_KEY points at it), or — if this etcd
+      does not run with client-cert-auth — set
+      CONTROL_PLANE_ETCD_CLIENT_CERT=false on the erawan host.
+  when:
+    - dcs_client_cert_enabled | bool
+    - not (_dcs_ca_key_stat.stat.exists | default(false))
+
+- name: Ensure the tenant client certificate directory exists
+  ansible.builtin.file:
+    path: "{{ dcs_client_cert_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: dcs_client_cert_enabled | bool
+
+# Three kinds of superseded pair, all of which the resolve step below would
+# otherwise adopt and keep in service forever:
+#
+#   - one carrying a CommonName, which fails every DCS request this tenant makes
+#     (see the note above),
+#   - one at the old flat path <parent>/<prefix>-<cluster>-user.pem, from before
+#     certificates were filed per engine, and
+#   - one at the un-timestamped name <cluster>-user.pem, from before a minted
+#     pair carried the time it was issued.
+#
+# Clearing them here is what lets the mint step re-issue, and this playbook runs
+# on every deploy, start/recover and add-member — so an affected tenant heals on
+# its next operation with nothing to do by hand. Re-issuing is safe in a way that
+# rotating the tenant's PASSWORD is not: the nodes are handed the new pair by the
+# same run, and the path they load it from on the node never changes.
+- name: Retire superseded tenant client certificates
+  ansible.builtin.shell: |
+    set -euo pipefail
+    dir="{{ dcs_client_cert_dir }}"
+    legacy_dir="$(dirname "$dir")"
+    prefix="{{ dcs_client_cert_prefix }}"
+
+    # Both halves of a pair always share a stem, whatever scheme named it.
+    retire() {
+      rm -f "$1" "${1%.pem}-key.pem"
+      echo "$2 $(basename "${1%.pem}")"
+    }
+
+    if [ -f "$legacy_dir/{{ dcs_tenant_user }}.pem" ]; then
+      retire "$legacy_dir/{{ dcs_tenant_user }}.pem" retired-legacy-path
+    fi
+
+    # Same tenant, per-engine directory, but named after the etcd user — what a
+    # control plane provisioned between the directory change and the rename
+    # holds. Left in place it is a valid credential for a cluster that may be
+    # long gone, and no cleanup would ever name it.
+    if [ -f "$dir/{{ dcs_tenant_user }}.pem" ]; then
+      retire "$dir/{{ dcs_tenant_user }}.pem" retired-superseded-name
+    fi
+
+    # Named after the cluster but with no issue time, from before the stamp.
+    # Retired rather than adopted so every pair in the directory can be read the
+    # same way, and so this tenant is dated from its next operation on.
+    if [ -f "$dir/$prefix.pem" ]; then
+      retire "$dir/$prefix.pem" retired-untimestamped
+    fi
+
+    # An unmatched glob expands to itself, hence the -f guard rather than a
+    # nullglob this shell would have to be told to set.
+    for cert in "$dir/$prefix"-*.pem; do
+      case "$cert" in *-key.pem) continue ;; esac
+      [ -f "$cert" ] || continue
+      # sep_multiline puts one RDN per line, so a CN is matched as its own field
+      # and never as a substring of some other value. The indent openssl uses for
+      # those lines has changed between releases, hence the leading " *".
+      if openssl x509 -in "$cert" -noout -subject -nameopt sep_multiline | grep -qE "^ *CN="; then
+        retire "$cert" retired-cn-certificate
+      fi
+    done
+  args:
+    executable: /bin/bash
+  register: _dcs_cert_retire
+  changed_when: "'retired-' in (_dcs_cert_retire.stdout | default(''))"
+  when: dcs_client_cert_enabled | bool
+
+# Evaluated once, here, rather than inside the name below: `now()` is resolved
+# at every template expansion, so a lazily-templated name would drift between
+# the openssl call that writes the pair and the read that publishes it.
+- name: Stamp the time a newly minted certificate is issued
+  ansible.builtin.set_fact:
+    _dcs_cert_stamp: "{{ now(utc=true).strftime('%Y%m%dT%H%M%SZ') }}"
+  when: dcs_client_cert_enabled | bool
+
+# Minting stays one-time per tenant: re-running provisioning must not hand a
+# live cluster a new certificate on every deploy, start and add-member, and a
+# stable pair is also what makes rotation an explicit act (delete the pair,
+# re-run) rather than a side effect. What the timestamp adds is that a pair is
+# never silently overwritten or inherited across incarnations of one cluster
+# name — a tenant re-created after a cleanup gets a visibly different file, and
+# the directory says when each credential was issued rather than only which
+# cluster holds it.
+- name: Resolve or mint the tenant client certificate
+  ansible.builtin.shell: |
+    set -euo pipefail
+    umask 077
+    cd "{{ dcs_client_cert_dir }}"
+    prefix="{{ dcs_client_cert_prefix }}"
+
+    # Newest pair wins. Names sort chronologically, but mtime is used so a pair
+    # placed here by hand (rotation, an out-of-band re-issue) is ordered too.
+    # Only a complete pair counts: half of one is not a usable credential.
+    name=""
+    for cert in "$prefix"-*.pem; do
+      case "$cert" in *-key.pem) continue ;; esac
+      [ -f "$cert" ] || continue
+      [ -f "${cert%.pem}-key.pem" ] || continue
+      if [ -z "$name" ] || [ "$cert" -nt "$name.pem" ]; then
+        name="${cert%.pem}"
+      fi
+    done
+
+    if [ -n "$name" ]; then
+      echo "client-cert-present $name"
+      exit 0
+    fi
+
+    name="$prefix-{{ _dcs_cert_stamp }}"
+
+    openssl req -new -newkey rsa:2048 -nodes \
+      -keyout "$name-key.pem" \
+      -out "$name.csr" \
+      -subj "/O=erawan"
+
+    # clientAuth is not optional: the Go TLS stack inside etcd rejects a
+    # client certificate that does not carry that extended key usage.
+    # (No apostrophes in this block — the free-form shell argument splitter
+    # reads one as an unterminated quote and fails the whole task.)
+    printf 'extendedKeyUsage=clientAuth\nkeyUsage=digitalSignature,keyEncipherment\n' > "$name.ext"
+
+    openssl x509 -req -sha256 \
+      -in "$name.csr" \
+      -CA "{{ dcs_ca_file }}" -CAkey "{{ dcs_ca_key_file }}" \
+      -CAcreateserial -CAserial "{{ dcs_client_cert_serial }}" \
+      -extfile "$name.ext" \
+      -days {{ dcs_client_cert_days }} \
+      -out "$name.pem"
+
+    rm -f "$name.csr" "$name.ext"
+    chmod 0600 "$name-key.pem" "$name.pem"
+    echo "client-cert-created $name"
+  args:
+    executable: /bin/bash
+  register: _dcs_cert_resolve
+  changed_when: "'client-cert-created ' in (_dcs_cert_resolve.stdout | default(''))"
+  when: dcs_client_cert_enabled | bool
+
+# The name the rest of the role reads the pair by. openssl writes its progress
+# to stderr, so the marker line is matched rather than the last line taken.
+- name: Record which certificate this tenant holds
+  ansible.builtin.set_fact:
+    dcs_client_cert_name: >-
+      {{ (_dcs_cert_resolve.stdout_lines
+          | select('match', '^client-cert-(created|present) ')
+          | last).split(' ') | last }}
+  when: dcs_client_cert_enabled | bool
+
+# Published for the client play, which installs these on the cluster nodes: the
+# CA so they trust the control plane's server certificate, and the tenant pair
+# so the control plane accepts theirs. Read here (where the files are) rather
+# than shipped from the erawan host, so a rotated CA propagates on the next run
+# with nothing to keep in sync.
+- name: Read the control-plane CA certificate
+  ansible.builtin.slurp:
+    src: "{{ dcs_ca_file }}"
+  register: _dcs_ca_blob
+
+- name: Read the tenant client certificate and key
+  ansible.builtin.slurp:
+    src: "{{ dcs_client_cert_dir }}/{{ item }}"
+  loop:
+    - "{{ dcs_client_cert_name }}.pem"
+    - "{{ dcs_client_cert_name }}-key.pem"
+  register: _dcs_client_pair
+  no_log: true
+  when: dcs_client_cert_enabled | bool
+
+- name: Publish the TLS material for the client play
+  ansible.builtin.set_fact:
+    dcs_ca_content: "{{ _dcs_ca_blob.content | b64decode }}"
+    dcs_client_cert_content: >-
+      {{ (_dcs_client_pair.results[0].content | b64decode)
+         if (dcs_client_cert_enabled | bool) else '' }}
+    dcs_client_key_content: >-
+      {{ (_dcs_client_pair.results[1].content | b64decode)
+         if (dcs_client_cert_enabled | bool) else '' }}
+  no_log: true
+
+- name: Check UFW availability and status on the control plane
+  ansible.builtin.command:
+    argv: [ufw, status]
+  register: _dcs_ufw_status
+  changed_when: false
+  failed_when: false
+
+# The control plane's client port is reachable only from the DB nodes that
+# actually hold a tenant on it, the same source-scoping model the engines use
+# for their own ports. Rules for nodes that were destroyed are dropped by the
+# cleanup playbook when the tenant goes away.
+- name: Allow the tenant's nodes to reach the control-plane client port
+  community.general.ufw:
+    rule: allow
+    port: "{{ dcs_client_port | string }}"
+    proto: tcp
+    src: "{{ item }}"
+    comment: erawan control-plane DCS client
+  loop: "{{ dcs_client_ips | default([], true) | unique }}"
+  when:
+    - _dcs_ufw_status.rc == 0
+    - "'Status: active' in (_dcs_ufw_status.stdout | default(''))"
+
+# Nodes that just left this cluster (remove-member) or were replaced by a scale
+# operation. Their grant has to go with them: CloudStack recycles IPs, so a
+# later unrelated VM would inherit reach to the control plane's client port.
+#
+# Both lists are defaulted with the boolean form: an operation that has no
+# nodes for one of them (a cleanup run has no clients, a deploy has nothing to
+# revoke) passes it through as JSON null, which is DEFINED — so the plain
+# `default([])` never fires and the filter below is handed a None.
+- name: Revoke departed nodes from the control-plane client port
+  community.general.ufw:
+    rule: allow
+    port: "{{ dcs_client_port | string }}"
+    proto: tcp
+    src: "{{ item }}"
+    delete: true
+  loop: >-
+    {{ dcs_revoke_ips | default([], true)
+       | difference(dcs_client_ips | default([], true))
+       | unique }}
+  when:
+    - _dcs_ufw_status.rc == 0
+    - "'Status: active' in (_dcs_ufw_status.stdout | default(''))"
+  failed_when: false

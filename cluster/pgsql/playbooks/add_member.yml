@@ -151,7 +151,28 @@
     - add_member_join
 
 # ---------------------------------------------------------------------------
-# PLAY 6 — Verify cluster health on all nodes
+# PLAY 6 — Exporters on the new member
+#
+# The deploy playbook runs setup_exporters as its own step against every node;
+# add_member had no equivalent, so a joining node came up with the exporter
+# binary present (it ships in the image) but no systemd unit and nothing
+# listening. The node passed verify_cluster and then failed every metrics
+# scrape with "connect: connection refused" on the exporter port — a UFW block
+# would have timed out instead, which is how the two are told apart.
+#
+# Only the new member is targeted: the role creates the monitoring role once,
+# delegated to the primary, so the existing nodes need nothing re-applied.
+# ---------------------------------------------------------------------------
+- name: Set up exporters on the new member
+  hosts: pgsql_new_member
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - setup_exporters
+
+# ---------------------------------------------------------------------------
+# PLAY 7 — Verify cluster health on all nodes
 # ---------------------------------------------------------------------------
 - name: Verify cluster after member addition
   hosts: all

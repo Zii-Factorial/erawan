@@ -1,6 +1,7 @@
 package haproxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,9 +10,23 @@ import (
 	"erawan-cluster/internal/render"
 )
 
+// DCSReleaser releases one cluster's tenant on the shared control plane: its
+// etcd role, user and keys, its client certificate, and the firewall grants
+// held for its nodes. Deleting a cluster's proxy config is how a cluster is
+// decommissioned, and without this the control plane accumulates a live
+// credential and an open client-port grant for every cluster ever deleted —
+// and node IPs get recycled, so that grant eventually belongs to someone else.
+//
+// Declared here rather than imported so the proxy layer keeps no dependency on
+// any particular engine; the API wires a pgsql adapter in.
+type DCSReleaser interface {
+	ReleaseDCS(ctx context.Context, jobID string) (releaseJobID string, err error)
+}
+
 // Handler holds the HAProxy service for HTTP route handling.
 type Handler struct {
 	service *haproxy.Service
+	dcs     DCSReleaser
 }
 
 /**
@@ -19,12 +34,14 @@ type Handler struct {
  *
  * Params:
  *   svc *haproxy.Service - the svc (*haproxy.Service)
+ *   dcs DCSReleaser - releases a deleted cluster's control-plane tenant; nil
+ *     leaves DeleteConfig a proxy-only operation
  *
  * Returns:
  *   *Handler - the resulting *Handler
  */
-func New(svc *haproxy.Service) *Handler {
-	return &Handler{service: svc}
+func New(svc *haproxy.Service, dcs DCSReleaser) *Handler {
+	return &Handler{service: svc, dcs: dcs}
 }
 
 // stringList accepts either a JSON string or an array of strings.
@@ -79,6 +96,15 @@ type addMemberRequest struct {
 
 type deleteRequest struct {
 	Port int `json:"port"`
+	// JobID identifies the cluster this port fronts, so deleting the config can
+	// also release its tenant on the shared control plane.
+	//
+	// It is explicit rather than inferred from the config's backend addresses:
+	// CloudStack recycles node IPs, so address matching can resolve to a
+	// DIFFERENT, live cluster — and releasing the wrong tenant deletes that
+	// cluster's Patroni keys, taking it down. A skipped cleanup leaves state
+	// behind; a wrong one destroys a running cluster, so this never guesses.
+	JobID string `json:"job_id"`
 }
 
 /**
@@ -264,7 +290,49 @@ func (h *Handler) DeleteConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	render.OK(w, "HAProxy config deleted and reloaded", map[string]any{"port": req.Port})
+	// The proxy config is already gone and HAProxy has reloaded, so the cluster
+	// is unreachable either way; a control-plane failure must not report the
+	// deletion as failed. It is surfaced in the payload instead, because a
+	// silent miss is exactly how an orphaned credential and an open client-port
+	// grant outlive the cluster they belonged to.
+	result := map[string]any{"port": req.Port}
+	for k, v := range h.releaseTenant(r.Context(), req.JobID) {
+		result[k] = v
+	}
+
+	render.OK(w, "HAProxy config deleted and reloaded", result)
+}
+
+/**
+ * releaseTenant releases the deleted cluster's tenant on the shared control
+ * plane and reports what happened, as fields to merge into the delete response.
+ *
+ * It never reports failure as success and never releases without being told
+ * which cluster to release, which is why the outcome is always stated rather
+ * than left implied by its absence.
+ *
+ * Receiver:
+ *   h *Handler - pointer receiver; the method may mutate this Handler instance
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   jobID string - the deploy job identifying the cluster; empty skips
+ *
+ * Returns:
+ *   map[string]any - "control_plane" status, plus "release_job_id" on success
+ */
+func (h *Handler) releaseTenant(ctx context.Context, jobID string) map[string]any {
+	switch {
+	case jobID == "":
+		return map[string]any{"control_plane": "skipped: no job_id supplied, tenant not released"}
+	case h.dcs == nil:
+		return map[string]any{"control_plane": "skipped: no control plane configured"}
+	}
+	releaseJobID, err := h.dcs.ReleaseDCS(ctx, jobID)
+	if err != nil {
+		return map[string]any{"control_plane": "release failed: " + err.Error()}
+	}
+	return map[string]any{"control_plane": "releasing", "release_job_id": releaseJobID}
 }
 
 /**

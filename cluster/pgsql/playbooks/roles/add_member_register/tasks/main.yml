@@ -19,6 +19,12 @@
     sleep: 2
   tags: ["add_member_register"]
 
+# ── etcd membership housekeeping (classic per-node etcd only) ───────────────
+# Every etcd task in this role is skipped when the DCS lives on the shared
+# control plane: there is no membership to register, no quorum to protect and
+# no stale voter to evict — adding a node is purely a Patroni operation, which
+# is exactly why that layout supports clusters of any size. What survives here
+# is the engine-level work: the leader gate and the DCS connection limit.
 - name: Probe etcd health on primary (non-fatal)
   ansible.builtin.shell: |
     set -euo pipefail
@@ -28,6 +34,7 @@
   register: _etcd_quick_health
   changed_when: false
   failed_when: false
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["add_member_register"]
 
 # The control plane's view of the cluster (primary + current standbys + the
@@ -36,6 +43,7 @@
 - name: Build expected cluster node list
   ansible.builtin.set_fact:
     _etcd_expected_ips: "{{ ([primary_ip] + (standby_ips | default([])) + [new_member_ip]) | unique }}"
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["add_member_register"]
 
 # force-new-cluster resets membership to just the local node, so it is only
@@ -46,7 +54,9 @@
 - name: Recover etcd from quorum lost to stale members
   ansible.builtin.include_role:
     name: etcd_recover_quorum
-  when: _etcd_quick_health.rc != 0
+  when:
+    - not (erawan_dcs_control_plane | bool)
+    - (_etcd_quick_health.rc | default(0)) != 0
   tags: ["add_member_register"]
 
 - name: Verify etcd is healthy on primary before registering new member
@@ -63,6 +73,7 @@
   retries: 30
   delay: 1
   failed_when: _etcd_health_check.rc != 0
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["add_member_register"]
 
 # The etcd gate above proves the DCS is healthy, but a replica can only be
@@ -161,9 +172,10 @@
   args:
     executable: /bin/bash
   environment:
-    EXPECTED_IPS: "{{ _etcd_expected_ips | join(',') }}"
+    EXPECTED_IPS: "{{ _etcd_expected_ips | default([]) | join(',') }}"
   register: _etcd_orphan_cleanup
   changed_when: "'removed=0' not in _etcd_orphan_cleanup.stdout"
+  when: not (erawan_dcs_control_plane | bool)
 
 - name: Retrieve current etcd member list
   ansible.builtin.shell: |
@@ -179,6 +191,7 @@
   retries: 25
   delay: 1
   until: etcd_members_json.rc == 0
+  when: not (erawan_dcs_control_plane | bool)
 
 - name: Parse existing etcd cluster peers
   ansible.builtin.set_fact:
@@ -189,6 +202,7 @@
         | flatten
         | join(',')
       }}
+  when: not (erawan_dcs_control_plane | bool)
 
 - name: Check whether new member is already registered
   ansible.builtin.set_fact:
@@ -198,6 +212,7 @@
         | selectattr('peerURLs', 'contains', 'http://' + new_member_ip + ':' + etcd_peer_port | string)
         | list | length > 0
       }}
+  when: not (erawan_dcs_control_plane | bool)
 
 # Use --learner so this works even on single-node clusters.
 # Direct member add requires post-add quorum (e.g. 2 of 2) but a 1-node cluster
@@ -213,7 +228,9 @@
       --peer-urls="http://{{ new_member_ip }}:{{ etcd_peer_port }}"
   args:
     executable: /bin/bash
-  when: not etcd_member_already_registered
+  when:
+    - not (erawan_dcs_control_plane | bool)
+    - not (etcd_member_already_registered | default(false))
   register: etcd_member_add
 
 - name: Build initial cluster string for new member
@@ -222,13 +239,18 @@
       {{
         etcd_existing_peers + ',new_member=http://' + new_member_ip + ':' + etcd_peer_port | string
       }}
-  when: not etcd_member_already_registered
+  when:
+    - not (erawan_dcs_control_plane | bool)
+    - not (etcd_member_already_registered | default(false))
 
 - name: Use existing cluster peers when member already registered
   ansible.builtin.set_fact:
     etcd_initial_cluster_for_new_member: "{{ etcd_existing_peers }}"
-  when: etcd_member_already_registered
+  when:
+    - not (erawan_dcs_control_plane | bool)
+    - etcd_member_already_registered | default(false)
 
 - name: Export initial cluster string for new member
   ansible.builtin.set_fact:
     hostvars_etcd_initial_cluster: "{{ etcd_initial_cluster_for_new_member }}"
+  when: not (erawan_dcs_control_plane | bool)

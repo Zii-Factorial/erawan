@@ -58,12 +58,12 @@ func TestValidateDeployRequestAppliesDefaults(t *testing.T) {
 
 func TestValidateDeployRequestRejectsBadInput(t *testing.T) {
 	cases := map[string]pgsql.DeployRequest{
-		"bad primary ip":            {PrimaryIP: "not-an-ip"},
-		"bad standby ip":            {PrimaryIP: "10.0.0.1", StandbyIPs: []string{"x"}},
-		"unsupported pg version":    {PrimaryIP: "10.0.0.1", PostgresVersion: 99},
-		"connection limit too low":  {PrimaryIP: "10.0.0.1", ConnectionLimit: 5},
+		"bad primary ip":                         {PrimaryIP: "not-an-ip"},
+		"bad standby ip":                         {PrimaryIP: "10.0.0.1", StandbyIPs: []string{"x"}},
+		"unsupported pg version":                 {PrimaryIP: "10.0.0.1", PostgresVersion: 99},
+		"connection limit too low":               {PrimaryIP: "10.0.0.1", ConnectionLimit: 5},
 		"connection limit below patroni minimum": {PrimaryIP: "10.0.0.1", ConnectionLimit: 20},
-		"connection limit too high": {PrimaryIP: "10.0.0.1", ConnectionLimit: 100001},
+		"connection limit too high":              {PrimaryIP: "10.0.0.1", ConnectionLimit: 100001},
 	}
 	for name, req := range cases {
 		req := req
@@ -182,8 +182,9 @@ func TestDeployPersistsRunningJobAndSecret(t *testing.T) {
 
 func TestGetComputesProgressWithSkippedSteps(t *testing.T) {
 	svc, store := newService(t)
-	// Empty spec skips standby_config (no standbys) and init_app_db (no user/db):
-	// 8 steps - 2 skipped = 6 applicable.
+	// Empty spec skips control_plane_dcs (cluster keeps its DCS on its own
+	// nodes), standby_config (no standbys) and init_app_db (no user/db):
+	// 9 steps - 3 skipped = 6 applicable.
 	job := &pgsql.Job{
 		ID:     testJobID,
 		Status: pgsql.JobStatusRunning,
@@ -348,11 +349,11 @@ func TestSetConnectionLimitRejectsInvalidRequests(t *testing.T) {
 	ctx := context.Background()
 
 	cases := map[string]dbmanager.SetConnectionLimitRequest{
-		"missing job_id":            {ConnectionLimit: 500},
-		"zero limit (deploy-only)":  {JobID: testJobID, ConnectionLimit: 0},
-		"connection limit too low":  {JobID: testJobID, ConnectionLimit: 5},
+		"missing job_id":                         {ConnectionLimit: 500},
+		"zero limit (deploy-only)":               {JobID: testJobID, ConnectionLimit: 0},
+		"connection limit too low":               {JobID: testJobID, ConnectionLimit: 5},
 		"connection limit below patroni minimum": {JobID: testJobID, ConnectionLimit: 20},
-		"connection limit too high": {JobID: testJobID, ConnectionLimit: 100001},
+		"connection limit too high":              {JobID: testJobID, ConnectionLimit: 100001},
 	}
 	for name, req := range cases {
 		if status, err := db.SetConnectionLimit(ctx, req); err == nil || status != nil {
@@ -366,5 +367,57 @@ func TestSetConnectionLimitRejectsInvalidRequests(t *testing.T) {
 	}
 	if _, err := db.GetConnectionLimit(ctx, testJobID); err == nil {
 		t.Fatal("expected get-connection-limit on an unknown job to fail")
+	}
+}
+
+func TestDeployWithoutControlPlaneKeepsDCSOnItsOwnNodes(t *testing.T) {
+	svc, store := newService(t)
+	job, err := svc.Deploy(context.Background(), pgsql.DeployRequest{
+		ClusterName:        "prodcluster",
+		PrimaryIP:          "10.0.0.1",
+		StepTimeoutSeconds: 30,
+	})
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	defer svc.Wait(context.Background())
+
+	// No SHARED_CONTROL_PLANE configured: the cluster must record the classic
+	// layout, so every later operation on it keeps using per-node etcd even if
+	// a control plane is configured on the process afterwards.
+	stored, err := store.Load(job.ID)
+	if err != nil {
+		t.Fatalf("load job: %v", err)
+	}
+	if stored.Request.ControlPlaneDCS {
+		t.Fatal("expected ControlPlaneDCS=false when no control plane is configured")
+	}
+	secret, err := svc.GetSecret(job.ID)
+	if err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	if secret.DCSPassword != "" || secret.DCSUser != "" {
+		t.Fatalf("expected no DCS credential to be minted, got user=%q", secret.DCSUser)
+	}
+}
+
+func TestReleaseDCSRejectsClusterWithoutControlPlane(t *testing.T) {
+	svc, store := newService(t)
+	if err := store.Save(&pgsql.Job{
+		ID:                testJobID,
+		Status:            pgsql.JobStatusCompleted,
+		LastCompletedStep: 6,
+		Request:           pgsql.StoredSpec{ClusterName: "pg-prod", PrimaryIP: "10.0.0.1"},
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Releasing a namespace that was never created would, at best, run etcdctl
+	// against a control plane this cluster does not use — reject it up front.
+	if _, err := svc.ReleaseDCS(context.Background(), testJobID); err == nil {
+		t.Fatal("expected release-dcs on a classic cluster to be rejected")
+	}
+	if _, err := svc.ReleaseDCS(context.Background(), "no-such-job"); err == nil {
+		t.Fatal("expected release-dcs on an unknown job to be rejected")
 	}
 }

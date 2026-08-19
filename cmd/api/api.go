@@ -4,10 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof handlers on the loopback pprof server
-	"path/filepath"
 	"time"
 
 	mysqlcluster "erawan-cluster/internal/cluster/mysql"
@@ -38,7 +38,6 @@ type application struct {
 	pgsqlDB              *dbmanager.Service
 	mysqlDB              *mysqldbmanager.Service
 	cipher               *security.Cipher
-	baseDir              string
 	enablePprof          bool
 	shutdownDrainSeconds int
 	jobDB                *sql.DB
@@ -69,9 +68,8 @@ func (app *application) mount() *chi.Mux {
 	r.Use(security.DecryptMiddleware(app.cipher))
 
 	r.Get("/health", app.healthCheckHandler)
-	r.Get("/docs", app.docsHandler)
 
-	haproxyH := haproxyapi.New(app.haproxy)
+	haproxyH := haproxyapi.New(app.haproxy, pgsqlDCSReleaser{svc: app.pgsqlCluster})
 	r.Route("/haproxy", func(r chi.Router) {
 		r.Post("/config/mysql", haproxyH.CreateMySQLConfig)
 		r.Patch("/config/mysql", haproxyH.AddMySQLMember)
@@ -119,6 +117,9 @@ func (app *application) mount() *chi.Mux {
 		r.Post("/stop", pgsqlH.StopJob)
 		r.Post("/members", pgsqlH.AddMember)
 		r.Delete("/members", pgsqlH.RemoveMember)
+		// Releases the cluster's tenant namespace on the shared control-plane
+		// etcd. Only meaningful for clusters deployed with SHARED_CONTROL_PLANE.
+		r.Delete("/dcs", pgsqlH.ReleaseDCS)
 		r.Get("/connection-limit", pgsqlH.GetConnectionLimit)
 		r.Put("/connection-limit", pgsqlH.SetConnectionLimit)
 		r.Post("/users", pgsqlH.CreateUser)
@@ -237,16 +238,38 @@ func bodyLimit(limit int64) func(http.Handler) http.Handler {
 	}
 }
 
+// pgsqlDCSReleaser adapts the PostgreSQL cluster service to the proxy layer's
+// DCSReleaser, so deleting a cluster's HAProxy config also releases its tenant
+// on the shared control plane. Only PostgreSQL needs it: MySQL carries its own
+// quorum and never takes a tenant on the control plane.
+type pgsqlDCSReleaser struct {
+	svc *pgsqlcluster.Service
+}
+
 /**
- * docsHandler serves the static API documentation page (index.html) from the
- * project base directory.
+ * ReleaseDCS starts the release job for one cluster and returns its job ID.
  *
  * Receiver:
- *   app *application - supplies baseDir, the root the file is resolved against.
+ *   p pgsqlDCSReleaser - value receiver; the method operates on a copy
+ *
  * Params:
- *   w http.ResponseWriter - the response writer the file is streamed to.
- *   r *http.Request - the incoming request, forwarded to http.ServeFile.
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   jobID string - the deploy job identifying the cluster to release
+ *
+ * Returns:
+ *   string - the release job's ID
+ *   error - non-nil when the release could not be started
  */
-func (app *application) docsHandler(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, filepath.Join(app.baseDir, "index.html"))
+func (p pgsqlDCSReleaser) ReleaseDCS(ctx context.Context, jobID string) (string, error) {
+	if p.svc == nil {
+		return "", fmt.Errorf("postgresql cluster service is not configured")
+	}
+	job, err := p.svc.ReleaseDCS(ctx, jobID)
+	if err != nil {
+		return "", err
+	}
+	if job == nil {
+		return "", nil
+	}
+	return job.ID, nil
 }

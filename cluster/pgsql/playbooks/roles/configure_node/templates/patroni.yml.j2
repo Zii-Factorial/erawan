@@ -6,11 +6,43 @@ restapi:
   listen: {{ ansible_host }}:{{ patroni_rest_port }}
   connect_address: {{ ansible_host }}:{{ patroni_rest_port }}
 
+{% if erawan_dcs_control_plane | bool %}
+{# Shared control-plane DCS. etcd3 (not etcd) because the control plane runs
+   the v3 API with RBAC: the v2 endpoints this file uses in the classic layout
+   do not carry v3 auth, and the tenant's role/user/keys are all v3 objects.
+   The node holds only the CA and its own tenant credential — no client
+   certificate, no root access, and no reach outside <namespace>/<scope>/. #}
+etcd3:
+  hosts:
+    - {{ control_plane_ip }}:{{ control_plane_etcd_client_port }}
+  protocol: https
+{# Without this, Patroni treats `hosts` as a seed list and calls
+   cluster/member/list on every connect to discover the etcd topology, then
+   loops on "Failed to get list of machines" when that call does not come back
+   in the shape it expects from a shared, RBAC-restricted control plane. The
+   discovery is wrong for us anyway: a tenant node is given the exact endpoint
+   it may use, and must not start talking to peers of a cluster it does not
+   own — the addresses it would learn may not even be reachable from its VPC.
+   use_proxies makes `hosts` the fixed, final endpoint list. #}
+  use_proxies: true
+  cacert: {{ patroni_etcd_ca_path }}
+{% if (patroni_etcd_client_cert_path | default('')) | length > 0 %}
+{# Required when the control plane runs client-cert-auth: without a client
+   certificate it aborts the TLS handshake ("certificate required") before any
+   credential is exchanged. The pair is this tenant's own, minted from the
+   control plane's CA with CN = the tenant's etcd user. #}
+  cert: {{ patroni_etcd_client_cert_path }}
+  key: {{ patroni_etcd_client_key_path }}
+{% endif %}
+  username: {{ control_plane_etcd_user }}
+  password: {{ control_plane_etcd_password | to_json }}
+{% else %}
 etcd:
   hosts:
 {% for host_name in groups['all'] %}
     - {{ hostvars[host_name].ansible_host }}:{{ etcd_client_port }}
 {% endfor %}
+{% endif %}
 
 bootstrap:
   dcs:

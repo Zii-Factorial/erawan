@@ -15,7 +15,36 @@ existing engine package.
 | Concurrency + shutdown | `core.Launcher` (bounded background jobs, `Wait` to drain) | wired by `Service` automatically |
 | Progress accounting | `core.ApplyProgress`, `core.CountCompletedSteps` | call from `updateJobProgress` |
 | SSH host-key policy | `core.SSHPolicy` (secure default) | `Runner.SetSSHPolicy` |
+| Shared control-plane DCS | `core.ControlPlane` — per-tenant etcd role/user/key prefix on a shared control plane, plus the inventory and `dcs_*` vars for the shared playbooks | `Runner.SetControlPlane` + `cluster/shared/playbooks/` |
 | ID / secret helpers | `core.NewJobID`, `core.OrRandomSecret` | — |
+
+### If your engine has no quorum of its own
+
+Engines whose HA depends on an external DCS (PostgreSQL/Patroni; not MySQL,
+whose Group Replication carries its own quorum) should use the shared control
+plane rather than putting an etcd on the tenant's data nodes — otherwise the
+tenant needs an odd node count and its HA is only as good as its own VMs.
+
+Adopting it is four small pieces, all modelled in `pgsql`:
+
+1. Give your `Runner` a `core.ControlPlane` (`SetControlPlane`) and run
+   `cluster/shared/playbooks/control_plane_dcs_provision.yml` as a step of your
+   deploy and start/recover flows and before each add-member; run
+   `control_plane_dcs_cleanup.yml` when a cluster is decommissioned. Build the
+   inventory and extra vars with `ControlPlane.InventoryYAML` / `DCSVars` — never
+   put the control plane in your engine's own inventory, whose plays target
+   `hosts: all`.
+2. Record the layout on the job's stored spec at deploy time (pgsql:
+   `StoredSpec.ControlPlaneDCS`) and read it — never the environment — for every
+   later operation, so toggling the variable cannot re-point a live cluster.
+3. Generate the tenant's DCS password once, at deploy, and keep it in the stored
+   secret. Later operations must not rotate it: they do not rewrite the engine
+   config on running nodes.
+4. Gate every local-DCS task in your playbooks on a single mode flag (pgsql:
+   `erawan_dcs_control_plane`) so nothing installs, starts, verifies or stops a
+   DCS that no longer exists.
+
+See [`cluster/shared/README.md`](../cluster/shared/README.md).
 
 ## Steps to add engine `foo`
 

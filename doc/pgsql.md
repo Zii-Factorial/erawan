@@ -45,7 +45,13 @@ DB Node VM
 | Single-node | 1 primary | No |
 | HA cluster | 1 primary + 1 or more standbys | Yes (automatic via Patroni) |
 
-For quorum, etcd needs an odd number of nodes. Use **3 or more** for production.
+With the default per-node etcd, quorum needs an odd number of nodes: use **3 or
+more** for production, and note that a 2-node cluster has no etcd quorum at all.
+
+That constraint disappears with the shared control plane
+(`SHARED_CONTROL_PLANE`): the DCS moves off the tenant's nodes, no etcd is
+installed on them, and any node count — 1 and 2 included — is fully supported.
+See [Shared control-plane DCS](#shared-control-plane-dcs) below.
 
 ---
 
@@ -263,6 +269,252 @@ HAProxy checks `GET http://<node>:8008/leader` on each backend. Patroni returns:
 - `503` — this node is a standby or not ready
 
 Only the leader receives client connections. After a failover, Patroni elects a new leader within seconds, and HAProxy reroutes automatically without any config change.
+
+---
+
+## Shared control-plane DCS
+
+PostgreSQL has no quorum mechanism of its own — Patroni borrows one from etcd.
+By default that etcd lives on the tenant's own database nodes (the box at the
+bottom of the diagram above), which is why production needs 3+ nodes and why a
+tenant losing one VM can cost it failover.
+
+Setting `SHARED_CONTROL_PLANE` to a control-plane host's private IP moves the DCS
+off the data plane. Clusters deployed from then on install **no etcd at all**:
+
+```
+  ┌─────────┐ ┌─────────┐            ┌────────────────────────────┐
+  │ Node 1  │ │ Node 2  │  https +   │  shared control-plane etcd │
+  │ Patroni ├─┤ Patroni ├──── auth ─▶│  /db/patroni/<cluster>/    │
+  └─────────┘ └─────────┘            │  user patroni-<cluster>-…  │
+       no local etcd                 └────────────────────────────┘
+```
+
+What each cluster is issued on the control plane:
+
+| Object | Value |
+|--------|-------|
+| Role | `patroni-<cluster>-role`, `readwrite` on `/db/patroni/<cluster>/` |
+| User | `patroni-<cluster>-user`, granted that role only |
+| Keys | `/db/patroni/<cluster>/…` — leader lock, config, members |
+| Client cert | `<engine>/<cluster>-user-<UTC stamp>.pem` on the control plane, **no CommonName** (see below) |
+
+etcd RBAC is prefix-based, so tenants cannot read or write each other's keys.
+Each node holds the control plane's CA (`/etc/patroni/etcd-ca.pem`), its tenant
+certificate (`/etc/patroni/etcd-client.pem` + key) and its username/password —
+never the root credential and never another tenant's material.
+
+The client certificate is what a control plane running `client-cert-auth: true`
+demands: it aborts the TLS handshake for a client presenting none, which shows
+up on the node as `tlsv13 alert certificate required` and leaves Patroni looping
+on `waiting on etcd`. Certificates are minted once per tenant from the CA and
+left in place — a redeploy or start/recover adopts the pair already on disk and
+never re-mints, so a live cluster cannot lose its credential to a routine
+operation. Each minted pair is named for the UTC time it was issued, so a
+cluster name re-used after a decommission gets a visibly distinct file instead
+of one silently overwritten or inherited, and the directory dates every
+credential on it. Rotation is deliberate: delete the pair under
+`/etc/etcd/ssl/erawan-clients/` and re-run the deploy — the new pair carries the
+time it was re-issued.
+Set `CONTROL_PLANE_ETCD_CLIENT_CERT=false` for a control plane that does not
+require client certificates.
+
+The certificate deliberately carries **no CommonName**, and that is not
+cosmetic — see [requirement 2](#2-tenant-client-certificates-must-carry-no-commonname)
+below. A pair minted before that rule is detected and re-issued automatically on
+the next `control_plane_dcs` run, so an affected cluster heals itself.
+
+Certificates are filed per engine on the control plane:
+
+```
+/etc/etcd/ssl/erawan-clients/
+  ca.srl                      one serial counter — X.509 serials are unique per CA
+  pgsql/
+    db-0001-user-20260818T110512Z.pem        minted 2026-08-18 11:05:12 UTC
+    db-0001-user-20260818T110512Z-key.pem
+```
+
+The engine directory is what keeps two engines apart. Without it, a PostgreSQL
+and a (say) Redis cluster both named `db-0001` mint to the same stem, and the
+rule that adopts an existing pair silently hands the second engine the first
+one's credential. `core.ControlPlane.ForEngine` derives the directory; the pre-existing
+flat layout is migrated on the next provisioning run and removed on cleanup.
+
+Note what `ForEngine` deliberately does **not** scope: the etcd user
+(`patroni-<cluster>-user`) and the key namespace (`/db/patroni/<cluster>/`).
+Both are written into a node's `patroni.yml`, and only a full deploy rewrites
+that file — renaming them would leave running nodes authenticating as a user
+nothing converges any more, and would point the next redeploy at an empty
+keyspace it would then bootstrap over live data. A second engine must be given
+its own prefix and namespace explicitly via `CONTROL_PLANE_DCS_TENANT_PREFIX`
+and `CONTROL_PLANE_DCS_NAMESPACE`, which is a deployment decision, not a
+derivation.
+
+**Lifecycle.** The tenant namespace is created by the `control_plane_dcs` step,
+which runs on every deploy, start/recover and add-member and is idempotent — it
+is also what re-installs the CA and re-opens the control plane's firewall for a
+node that a scale operation rebuilt with a new IP. Removing a member revokes that
+node's access. `DELETE /cluster/pgsql/dcs` releases the whole tenant (keys, user,
+role, firewall grants) when a cluster is decommissioned; nothing else does, and
+the objects are named after the cluster, so a later cluster of the same name
+would otherwise inherit them.
+
+### Configuring the control plane
+
+Erawan **consumes** the control plane and never provisions it: it creates and
+deletes per-tenant roles, users, key prefixes and firewall grants, and nothing
+else. Standing up the host — etcd, TLS material, the root user, `auth enable` —
+is yours. Erawan reaches it over SSH with the cluster's own key by default.
+
+Four requirements below are load-bearing, and none of them is caught by the
+obvious `curl https://<cp>:2379/version` smoke test — that endpoint is served by
+etcd's own HTTP handler and answers even when the API Patroni actually uses is
+completely unavailable. All four were verified against etcd 3.4.30.
+
+#### Reference `/etc/etcd/etcd.conf.yml`
+
+```yaml
+name: cp-etcd-01
+data-dir: /var/lib/etcd
+
+listen-peer-urls: https://10.10.3.66:2380
+listen-client-urls: https://10.10.3.66:2379,https://127.0.0.1:2379
+
+initial-advertise-peer-urls: https://10.10.3.66:2380
+advertise-client-urls: https://10.10.3.66:2379
+
+initial-cluster: cp-etcd-01=https://10.10.3.66:2380
+initial-cluster-state: new
+initial-cluster-token: erawan-shared-cp
+
+enable-grpc-gateway: true          # requirement 1 — NOT the default here
+
+client-transport-security:
+  cert-file: /etc/etcd/ssl/cp-etcd-01.pem
+  key-file: /etc/etcd/ssl/cp-etcd-01-key.pem
+  trusted-ca-file: /etc/etcd/ssl/ca.pem
+  client-cert-auth: true
+
+peer-transport-security:
+  cert-file: /etc/etcd/ssl/cp-etcd-01.pem
+  key-file: /etc/etcd/ssl/cp-etcd-01-key.pem
+  trusted-ca-file: /etc/etcd/ssl/ca.pem
+  peer-client-cert-auth: true
+```
+
+#### 1. The gRPC JSON gateway must be enabled
+
+Patroni's `etcd3` client speaks etcd v3 over **HTTP** (`POST /v3/...`), never
+gRPC directly. Those paths exist only when the gateway is on — and etcd defaults
+that setting differently depending on how the process starts:
+
+| Started with | `enable-grpc-gateway` default |
+|--------------|-------------------------------|
+| command-line flags | `true` |
+| `--config-file` | **`false`** |
+
+The flag is registered with a `true` default in `etcdmain/config.go`, but the
+struct field it fills is a plain bool in `embed/config.go` that `NewConfig()`
+never sets — so a config-file deployment that merely *omits* the key runs with
+the gateway off. Nothing warns you. Set it explicitly, as above.
+
+With the gateway off, `/version` still answers and `etcdctl` still works (it
+speaks gRPC on the same port), so the `control_plane_dcs` step provisions the
+tenant successfully. Then every Patroni call receives a plain-text
+`404 page not found` body, which Patroni JSON-decodes into the integer `404`
+and dies on:
+
+```
+AttributeError: 'int' object has no attribute 'get'
+```
+
+#### 2. Tenant client certificates must carry no CommonName
+
+When `client-cert-auth`, the gateway and RBAC auth are **all three** on, etcd
+rejects every `/v3` request whose client certificate has a non-empty CN:
+
+```
+HTTP 400  CommonName of client sending a request against gateway
+          will be ignored and not used as expected
+```
+
+The guard is in etcd's `embed/serve.go`: CN-derived identity cannot be conveyed
+across the gateway, so rather than silently ignoring it, etcd refuses the
+request. Erawan therefore mints tenant certificates with subject `/O=erawan` and
+no CN — the tenant is identified by its RBAC username and password instead, and
+prefix isolation is unaffected.
+
+#### 3. The control plane's server certificate needs `clientAuth`
+
+The gateway proxies inbound HTTP to etcd's own gRPC listener, connecting to
+itself as a client using the server certificate. With `client-cert-auth: true`
+that certificate must therefore carry **both** extended key usages, or every
+`/v3` request returns HTTP 503 `error reading server preface: remote error:
+tls: bad certificate`:
+
+```bash
+openssl x509 -in /etc/etcd/ssl/cp-etcd-01.pem -noout -ext extendedKeyUsage
+# TLS Web Server Authentication, TLS Web Client Authentication
+```
+
+The certificate must also carry the control plane's IP in its SANs: Patroni
+verifies it against the IP it dials, and `control_plane_dcs` fails by name on
+that rather than letting the cluster start and fail every DCS call later.
+
+A loopback entry in `listen-client-urls` (`https://127.0.0.1:2379` above) is what
+the gateway dials, so keep it.
+
+#### 4. RBAC must be enabled
+
+Prefix-scoped RBAC is the only thing keeping tenants off each other's keys.
+Erawan creates per-tenant roles and users but never runs `auth enable`:
+
+```bash
+etcdctl user add root --interactive=false --new-user-password='<root-pw>'
+etcdctl auth enable
+```
+
+That password is what `CONTROL_PLANE_ETCD_ROOT_PASSWORD` must match. If auth is
+left off, deploys still succeed — Patroni tolerates it — but every tenant can
+read and write every other tenant's Patroni state. The `control_plane_dcs` step
+emits a warning in that case rather than failing.
+
+#### Verifying
+
+Run from the control plane after any change. The `control_plane_dcs` step runs
+the same check from each database node and fails the deploy with the cause named,
+so this is a pre-flight, not the only line of defence:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  --cacert /etc/etcd/ssl/ca.pem \
+  --cert /etc/etcd/ssl/cp-etcd-01.pem \
+  --key /etc/etcd/ssl/cp-etcd-01-key.pem \
+  -X POST https://10.10.3.66:2379/v3/auth/authenticate -d '{}'
+```
+
+`404` means the gateway is off. Anything else means it is serving — including
+`400`, which here is just requirement 2 firing on the server certificate's own
+CN and confirms the gateway is live.
+
+#### Symptom index
+
+| Seen on the node | Cause |
+|------------------|-------|
+| `AttributeError: 'int' object has no attribute 'get'` in the Patroni journal | Gateway off — requirement 1 |
+| HTTP 400 `CommonName ... will be ignored` | Tenant certificate has a CN — requirement 2 |
+| HTTP 503 `error reading server preface: ... tls: bad certificate` | Server certificate lacks `clientAuth` — requirement 3 |
+| `tlsv13 alert certificate required` | Node has no client certificate; check `CONTROL_PLANE_ETCD_CLIENT_CERT` |
+| `certificate verify failed` / IP address mismatch | Control-plane IP missing from the server certificate's SANs |
+| Deploy warns `authentication is not enabled` | `auth enable` never run — requirement 4 |
+| `invalid user ID or password` | Tenant user dropped out of band, or the job's DCS password no longer matches |
+
+Changing any of the above needs an etcd restart, which briefly drops the DCS for
+**every** tenant on the control plane. Patroni rides out a short outage without
+failing over, but time it deliberately.
+
+**Existing clusters are never migrated.** Each job records the DCS layout it was
+deployed with, so turning the variable on or off cannot re-point a live cluster.
 
 ---
 

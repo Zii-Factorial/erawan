@@ -1,0 +1,19 @@
+---
+# Where the control plane's CA lands on a cluster node, and who must be able to
+# read it. Defaults suit Patroni (runs as postgres); another engine overrides
+# these three without touching the role.
+dcs_client_ca_path: /etc/patroni/etcd-ca.pem
+dcs_client_ca_owner: postgres
+dcs_client_ca_group: postgres
+dcs_client_ca_mode: "0644"
+
+# The tenant's client certificate, needed by a control plane running with
+# client-cert-auth. Installed only when the control-plane play minted one.
+dcs_client_cert_enabled: true
+dcs_client_cert_path: /etc/patroni/etcd-client.pem
+dcs_client_key_path: /etc/patroni/etcd-client-key.pem
+
+# Bounded wait for the node to be manageable. Provisioning runs before the
+# engine's own preflight on the add-member path, so it can be the first thing
+# to touch a VM that was created seconds ago.
+dcs_client_connect_timeout_seconds: 300

@@ -121,12 +121,37 @@ Add a single node to an existing PostgreSQL HAProxy backend.
 
 ### `DELETE /haproxy/config`
 
-Remove a HAProxy tenant config and reload.
+Remove a HAProxy tenant config and reload. This is how a cluster is
+decommissioned, so it also releases that cluster's tenant on the shared control
+plane — its etcd role, user and keys, its client certificate, and the firewall
+grants held for its nodes.
 
 **Request:**
 ```json
-{ "port": 25041 }
+{ "port": 25041, "job_id": "8c84969fef4794ea8bd1fc1c" }
 ```
+
+`job_id` is the cluster's deploy job. It is **required for the control-plane
+release** and deliberately not inferred from the config's backend addresses:
+node IPs are recycled, so address matching can resolve to a different, live
+cluster — and releasing the wrong tenant deletes that cluster's Patroni keys and
+takes it down. Omitting it leaves the proxy delete working exactly as before.
+
+The response always states what happened on the control plane, because a silent
+miss is how an orphaned credential and an open client-port grant outlive the
+cluster they belonged to:
+
+| `control_plane` | Meaning |
+|-----------------|---------|
+| `releasing` | Release job started; its ID is in `release_job_id` |
+| `skipped: no job_id supplied, tenant not released` | Proxy config deleted, control plane untouched |
+| `skipped: no control plane configured` | This deployment uses per-node etcd |
+| `release failed: …` | Config deleted, tenant **not** released — the cause is included |
+
+The proxy config is removed and HAProxy reloaded before this runs, so a
+control-plane failure never fails the delete; the cluster is unreachable either
+way. Re-run `DELETE /cluster/pgsql/dcs` with the same job ID to retry a failed
+release.
 
 ---
 
@@ -706,6 +731,66 @@ Remove a standby node from the Patroni cluster. Subject to the same one-at-a-tim
 | `job_id` | string | yes | Source deploy job ID |
 | `member_ip` | string | yes | IP of the standby to remove |
 | `force` | bool | no | Force removal even if the node is unreachable |
+
+---
+
+### `DELETE /cluster/pgsql/dcs`
+
+Release the cluster's namespace on the **shared control-plane etcd**: its Patroni
+keys (`/db/patroni/<cluster>/`), its etcd user and role, and its nodes' access to
+the control plane's client port.
+
+Only for clusters deployed with `SHARED_CONTROL_PLANE`; a cluster that keeps its
+DCS on its own nodes is rejected. Runs against the control plane alone, so it
+works after the cluster's VMs are destroyed.
+
+Call it when decommissioning a cluster. `DELETE /haproxy/config` does this for
+you when given a `job_id`; this endpoint is how you clear clusters deleted before
+that existed, or retry a release that failed.
+
+**Request** — one cluster:
+```json
+{ "job_id": "8c84969fef4794ea8bd1fc1c" }
+```
+
+**Request** — several at once, for clearing a backlog:
+```json
+{ "job_ids": ["8c84969f…", "a1b2c3d4…"], "confirm": true }
+```
+
+`confirm` is required for the batch form only, so single releases are unchanged.
+A batch reports each cluster separately and never fails as a whole — releasing
+four and failing on the fifth must not look like nothing happened:
+
+```json
+{ "released": 1, "requested": 2, "results": [
+    { "job_id": "8c84969f…", "status": "releasing", "release_job_id": "…" },
+    { "job_id": "a1b2c3d4…", "status": "failed", "error": "load job: not found" } ] }
+```
+
+There is deliberately **no "release everything unused" mode.** Nothing in this
+system records that a cluster was deleted, so a stopped cluster and a
+decommissioned one are indistinguishable — and purging a stopped cluster's keys
+strips the Patroni state it expects on its next start. Every release names its
+clusters explicitly.
+
+Every leaked tenant still has its deploy job, since jobs are never pruned: find
+the IDs with `GET /cluster/pgsql/jobs?limit=50` and match on
+`request.cluster_name`.
+
+Nothing else removes these objects, and
+they are named after the cluster — a later cluster of the same name would inherit
+them. PostgreSQL **data is untouched**, but a cluster whose nodes are still
+running loses its DCS and stops electing a leader, so release it after stopping
+or destroying the nodes. Rejected while another operation on the cluster is in
+flight.
+
+**Request:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `job_id` | string | yes | Source deploy job ID |
+
+Returns `202 Accepted` with a job whose single step is `release_control_plane_dcs`.
 
 ---
 

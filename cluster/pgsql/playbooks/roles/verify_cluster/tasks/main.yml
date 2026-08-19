@@ -1,10 +1,14 @@
 ---
+# Both etcd checks are skipped when the DCS lives on the shared control plane:
+# the node has no etcd unit, and Patroni's own health (checked below) is the
+# real proof that it can reach the DCS.
 - name: Check etcd service is enabled
   ansible.builtin.command:
     argv: [systemctl, is-enabled, etcd]
   register: etcd_enabled
   changed_when: false
   failed_when: etcd_enabled.rc != 0
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["verify_cluster"]
 
 - name: Check Patroni service is enabled
@@ -29,6 +33,7 @@
   retries: 10
   delay: 3
   changed_when: false
+  when: not (erawan_dcs_control_plane | bool)
   tags: ["verify_cluster"]
 
 - name: Check Patroni is active

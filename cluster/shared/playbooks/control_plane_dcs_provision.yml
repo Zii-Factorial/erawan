@@ -1,0 +1,41 @@
+---
+# Provisions one tenant namespace on the SHARED control-plane etcd and prepares
+# the tenant's nodes to use it. Engine-agnostic on purpose: the caller supplies
+# dcs_scope (the cluster name) and the client node list, nothing about the
+# engine leaks in here — see cluster/shared/README.md.
+#
+# Idempotent, and deliberately re-run on every deploy, resume, start/recover
+# and add-member: that is what heals a rebuilt node (its CA file is gone) or a
+# tenant whose role/user was dropped out of band.
+#
+# Inventory (built by the Go runner):
+#   control_plane  — the one control-plane host, reached over SSH
+#   dcs_clients    — the cluster nodes that will talk to it
+
+# ---------------------------------------------------------------------------
+# PLAY 1 — Create the tenant's role, user and key prefix on the control plane
+# ---------------------------------------------------------------------------
+- name: Provision the tenant namespace on the shared control-plane DCS
+  hosts: control_plane
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: etcd_dcs_tenant
+      vars:
+        dcs_action: provision
+
+# ---------------------------------------------------------------------------
+# PLAY 2 — Install the control plane's CA on the tenant's nodes
+# ---------------------------------------------------------------------------
+- name: Prepare the cluster nodes for the shared control-plane DCS
+  hosts: dcs_clients
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    dcs_ca_content: "{{ hostvars[groups['control_plane'][0]].dcs_ca_content }}"
+    dcs_client_cert_content: "{{ hostvars[groups['control_plane'][0]].dcs_client_cert_content | default('') }}"
+    dcs_client_key_content: "{{ hostvars[groups['control_plane'][0]].dcs_client_key_content | default('') }}"
+  roles:
+    - etcd_dcs_client

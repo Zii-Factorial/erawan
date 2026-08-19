@@ -60,7 +60,7 @@ func buildApplication(ctx context.Context, cfg runtimeConfig) (*application, err
 		return nil, err
 	}
 
-	pgsqlStore, pgsqlSvc, err := buildPGSQLCluster(ctx, cfg.pgsql, cfg.ssh, cfg.server.proxyHost, cfg.maxConcurrentJobs, jobDB)
+	pgsqlStore, pgsqlSvc, err := buildPGSQLCluster(ctx, cfg.pgsql, cfg.ssh, cfg.controlPlane.ForEngine("pgsql"), cfg.server.proxyHost, cfg.maxConcurrentJobs, jobDB)
 	if err != nil {
 		if jobDB != nil {
 			_ = jobDB.Close()
@@ -81,7 +81,6 @@ func buildApplication(ctx context.Context, cfg runtimeConfig) (*application, err
 		pgsqlDB:              dbmanager.NewService(pgsqlStore, cfg.server.proxyHost),
 		mysqlDB:              mysqldbmanager.NewService(mysqlStore, cfg.server.proxyHost),
 		cipher:               cipher,
-		baseDir:              cfg.baseDir,
 		enablePprof:          cfg.enablePprof,
 		shutdownDrainSeconds: cfg.shutdownDrainSeconds,
 		jobDB:                jobDB,
@@ -198,15 +197,26 @@ func buildMySQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConf
  *   ctx context.Context - base context for the service's background jobs.
  *   cfg clusterEngineConfig - state dir, playbook paths and Ansible tunables.
  *   ssh sshConfig - shared SSH credentials and host-key policy.
+ *   controlPlane core.ControlPlane - the shared control plane carrying the
+ *     Patroni DCS, when SHARED_CONTROL_PLANE is configured. PostgreSQL has no
+ *     quorum mechanism of its own, so with it enabled new clusters keep no etcd
+ *     on their own nodes and any node count is supported.
  *   proxyAllowedIP string - the HAProxy/control-plane IP allowed to reach
  *     client-facing DB ports and accounts (see PROXY_HOST).
  *   maxConcurrentJobs int - cap on concurrent background jobs for this engine.
  * Returns:
  *   pgsqlcluster.Store - the job store (reused by the DB manager).
  *   *pgsqlcluster.Service - the assembled cluster service.
- *   error - if the store cannot be created or SSH config is invalid.
+ *   error - if the store cannot be created, SSH config is invalid, or the
+ *     control plane is configured incompletely.
  */
-func buildPGSQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConfig, proxyAllowedIP string, maxConcurrentJobs int, jobDB *sql.DB) (pgsqlcluster.Store, *pgsqlcluster.Service, error) {
+func buildPGSQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConfig, controlPlane core.ControlPlane, proxyAllowedIP string, maxConcurrentJobs int, jobDB *sql.DB) (pgsqlcluster.Store, *pgsqlcluster.Service, error) {
+	// Fail at start-up rather than mid-deploy: a control plane that is named but
+	// not usable would otherwise produce clusters that cannot reach their DCS.
+	if err := controlPlane.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("init pgsql control plane: %w", err)
+	}
+
 	store, err := buildPGSQLStore(cfg.stateDir, jobDB)
 	if err != nil {
 		return nil, nil, fmt.Errorf("init pgsql cluster store: %w", err)
@@ -220,6 +230,7 @@ func buildPGSQLCluster(ctx context.Context, cfg clusterEngineConfig, ssh sshConf
 	runner.SetDebug(cfg.ansible.verbosity, cfg.ansible.debug, cfg.ansible.stepOutputMaxChars)
 	runner.SetSSHPolicy(ssh.policy())
 	runner.SetProxyAllowedIP(proxyAllowedIP)
+	runner.SetControlPlane(controlPlane)
 
 	svc := pgsqlcluster.NewService(store, runner)
 	svc.SetMaxConcurrentJobs(maxConcurrentJobs)

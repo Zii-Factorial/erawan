@@ -1,0 +1,51 @@
+---
+# Runs ON the shared control-plane host. Everything here is engine-agnostic:
+# it only ever creates or drops one tenant's etcd role, user and key prefix, so
+# any engine whose HA needs an external DCS (PostgreSQL/Patroni today) can
+# reuse it unchanged — see cluster/shared/README.md.
+
+# dcs_scope is what scopes the RBAC grant AND what cleanup deletes with
+# --prefix. An empty or exotic value would widen that prefix to the whole
+# namespace, i.e. every other tenant on the shared control plane, so it is
+# validated here rather than trusted from the caller.
+- name: Validate the control-plane DCS parameters
+  ansible.builtin.assert:
+    that:
+      - (dcs_endpoint_ip | default('') | trim) | length > 0
+      - (dcs_root_password | default('')) | length > 0
+      - (dcs_scope | default('') | trim) is match('^[A-Za-z0-9_-]{3,64}$')
+      - dcs_namespace.startswith('/')
+      - dcs_namespace.endswith('/')
+    fail_msg: >-
+      Control-plane DCS parameters are incomplete: need dcs_endpoint_ip,
+      dcs_root_password, a dcs_scope matching ^[A-Za-z0-9_-]{3,64}$ (got
+      {{ dcs_scope | default('') | trim | to_json }}), and a dcs_namespace
+      delimited by slashes (got {{ dcs_namespace | to_json }}).
+    quiet: true
+
+# Fails here with a precise message rather than inside etcdctl with a generic
+# "open ...: no such file or directory". The control plane is assumed to be
+# already provisioned (certs + root user + auth enable); erawan only consumes it.
+- name: Check the control-plane etcd TLS material
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ dcs_ca_file }}"
+    - "{{ dcs_cert_file }}"
+    - "{{ dcs_key_file }}"
+  register: _dcs_tls_stat
+
+- name: Fail when the control-plane etcd TLS material is missing
+  ansible.builtin.fail:
+    msg: >-
+      {{ item.item }} does not exist on the control plane
+      ({{ dcs_endpoint_ip }}). This host is expected to be an already
+      provisioned etcd control plane — check CONTROL_PLANE_ETCD_CACERT /
+      _CERT / _KEY on the erawan host if the paths differ.
+  loop: "{{ _dcs_tls_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not item.stat.exists
+
+- name: Run the requested control-plane DCS action
+  ansible.builtin.include_tasks: "{{ dcs_action }}.yml"

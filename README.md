@@ -1,7 +1,3 @@
-<p >
-  <img src="doc/assets/A5172f582418f41729f3c587f6a5f95e6w.png" alt="erawan-cluster logo" width="180"/>
-</p>
-
 # erawan-cluster
 
 **Version 1.02** — Cluster Management API for automated database cluster lifecycle management, live metrics collection, and HAProxy configuration.
@@ -42,6 +38,7 @@
 | `POST /cluster/mysql/jobs/{id}/rollback` | Dissolve a MySQL cluster (MySQL only) |
 | `POST /cluster/{engine}/members` | Add members (joined one at a time) |
 | `DELETE /cluster/{engine}/members` | Remove a member |
+| `DELETE /cluster/pgsql/dcs` | Release the cluster's namespace on the shared control-plane etcd when decommissioning it (PostgreSQL, `SHARED_CONTROL_PLANE` deployments only); body: `{"job_id"}` |
 | `POST /cluster/{engine}/metrics` | Live metrics via Prometheus exporters |
 
 See [doc/api.md](doc/api.md) for the full API reference.  
@@ -207,6 +204,23 @@ Both should succeed (`clusterops`, then `root`).
 | `CLUSTER_DB_TLS_MODE` | `verify` | MySQL admin TLS mode: `verify` (default) \| `skip-verify` \| `false` (disabled) |
 | `CLUSTER_DB_SSL_MODE` | `verify-full` | PostgreSQL admin SSL mode: `verify-full` (default) \| `verify-ca` \| `require` \| `disable` |
 | `CLUSTER_MAX_CONCURRENT_JOBS` | `4` | Cap on simultaneous background cluster jobs |
+| `SHARED_CONTROL_PLANE` | — | Private IP of the shared control-plane etcd. Set it and new PostgreSQL clusters keep no etcd on their own nodes (any node count is supported); unset keeps the classic per-node etcd quorum. Existing clusters are never migrated |
+| `CONTROL_PLANE_ETCD_ROOT_PASSWORD` | — | etcd root password used to manage per-tenant RBAC. Required when `SHARED_CONTROL_PLANE` is set — the process refuses to start without it |
+| `CONTROL_PLANE_ETCD_ROOT_USER` | `root` | etcd superuser on the control plane |
+| `CONTROL_PLANE_ETCD_CLIENT_PORT` | `2379` | Control-plane etcd client port |
+| `CONTROL_PLANE_ETCD_CACERT` / `_CERT` / `_KEY` | `/etc/etcd/ssl/{ca,cp-etcd-01,cp-etcd-01-key}.pem` | TLS material as it exists **on the control plane**; only the CA is copied to DB nodes |
+| `CONTROL_PLANE_DCS_NAMESPACE` | `/db/patroni/` | Key namespace; a tenant owns `<namespace><cluster_name>/` |
+| `CONTROL_PLANE_DCS_TENANT_PREFIX` | `patroni` | Names the per-tenant etcd role/user (`<prefix>-<cluster>-role`/`-user`) |
+| `CONTROL_PLANE_ETCD_CLIENT_CERT` | `true` | Issue each cluster its own etcd client certificate. Required by a control plane running `client-cert-auth: true`, which refuses the TLS handshake without one. Needs the CA key below |
+| `CONTROL_PLANE_ETCD_CA_KEY` | `/etc/etcd/ssl/ca-key.pem` | CA private key on the control plane that signs tenant client certificates |
+| `CONTROL_PLANE_ETCD_CLIENT_CERT_DIR` | `/etc/etcd/ssl/erawan-clients` | Where minted tenant certificates are kept on the control plane |
+| `CONTROL_PLANE_ETCD_CLIENT_CERT_DAYS` | `3650` | Validity of a minted tenant certificate |
+| `CONTROL_PLANE_ETCD_NODE_CERT_PATH` / `_KEY_PATH` | `/etc/patroni/etcd-client{,-key}.pem` | Where the tenant certificate lands on each DB node |
+| `CONTROL_PLANE_ETCD_NODE_CA_PATH` | `/etc/patroni/etcd-ca.pem` | Where the control plane's CA lands on each DB node |
+| `CONTROL_PLANE_ETCD_NODE_CA_OWNER` | `postgres` | OS user that must read that CA (the engine's service account) |
+| `CONTROL_PLANE_SSH_USER` / `_PRIVATE_KEY_PATH` / `_PORT` | — | Overrides for reaching the control plane; defaults to the cluster SSH credentials |
+| `CONTROL_PLANE_DCS_PROVISION_PLAYBOOK` | `<project>/cluster/shared/playbooks/control_plane_dcs_provision.yml` | Shared tenant-provisioning playbook |
+| `CONTROL_PLANE_DCS_CLEANUP_PLAYBOOK` | `<project>/cluster/shared/playbooks/control_plane_dcs_cleanup.yml` | Shared tenant-release playbook |
 | `ENABLE_PPROF` | `false` | Expose `net/http/pprof` on `127.0.0.1:6060` (debugging only, no auth) |
 
 ---

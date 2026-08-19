@@ -1,0 +1,92 @@
+---
+# Which task file main.yml dispatches to: provision (create) or cleanup (drop).
+dcs_action: provision
+
+# ── Control-plane endpoint ──────────────────────────────────────────────────
+# dcs_endpoint_ip is the control plane's private IP (SHARED_CONTROL_PLANE).
+dcs_client_port: 2379
+
+# TLS material, as it exists ON the control-plane host. etcdctl runs there, so
+# these are local paths, never copied to the controller or to DB nodes — only
+# dcs_ca_file is published to cluster nodes (see the etcd_dcs_client role).
+dcs_ca_file: /etc/etcd/ssl/ca.pem
+dcs_cert_file: /etc/etcd/ssl/cp-etcd-01.pem
+dcs_key_file: /etc/etcd/ssl/cp-etcd-01-key.pem
+
+# ── Per-tenant client certificates ──────────────────────────────────────────
+# An etcd running with client-cert-auth: true refuses the TLS handshake unless
+# the client presents a certificate signed by its CA — the DB nodes cannot
+# reach it with the CA alone. Each tenant therefore gets its own client
+# certificate, minted here from the control plane's CA and installed on that
+# tenant's nodes only, so one tenant's credential can be revoked without
+# touching any other.
+#
+# Set dcs_client_cert_enabled: false for a control plane that does not require
+# client certificates; the nodes then connect with the CA plus their etcd
+# username/password alone and no CA key is needed.
+dcs_client_cert_enabled: true
+dcs_ca_key_file: /etc/etcd/ssl/ca-key.pem
+# Minted certificates live here, one pair per tenant, so they can be inspected,
+# rotated or revoked out of band. Kept off the CA's own directory so the CA
+# serial file this writes never lands next to the CA key.
+# The Go runner appends the engine name (see core.ControlPlane.ForEngine), so
+# this is the per-engine directory: /etc/etcd/ssl/erawan-clients/<engine>/.
+dcs_client_cert_dir: /etc/etcd/ssl/erawan-clients
+dcs_client_cert_days: 3650
+# Certificates are named after the cluster, not after the etcd user: the engine
+# directory above already disambiguates, so repeating the engine in the filename
+# would only make it longer.
+#
+# This is only the stem. Provisioning appends the UTC time it minted the pair —
+# <cluster>-user-<YYYYMMDDTHHMMSSZ>.pem, with the key beside it as
+# ...-<stamp>-key.pem — and resolves the full name into dcs_client_cert_name for
+# the rest of the role. A tenant keeps the pair it was issued (provisioning
+# re-runs adopt it rather than re-minting); what the stamp buys is that two
+# incarnations of one cluster name can never occupy the same filename, so a pair
+# is never silently overwritten or inherited, and the directory shows when each
+# credential was issued instead of only which cluster holds it.
+#
+# Cleanup deletes <prefix>-* — anchored on the whole stem, so a tenant never
+# matches a longer name that merely starts with its own (db-2 against db-20).
+dcs_client_cert_prefix: "{{ dcs_scope }}-user"
+# X.509 serial numbers must be unique per CA, not per directory — one serial
+# file per engine would let two engines mint different certificates carrying the
+# same serial from the same CA. Kept one level up, where every engine shares it.
+dcs_client_cert_serial: "{{ dcs_client_cert_dir | dirname }}/ca.srl"
+
+# The etcd superuser that owns RBAC on the shared control plane. Its password
+# comes from the erawan host's CONTROL_PLANE_ETCD_ROOT_PASSWORD.
+dcs_root_user: root
+
+# Key namespace every tenant hangs off. A tenant owns exactly
+# <dcs_namespace><dcs_scope>/ and is granted nothing outside it.
+dcs_namespace: /db/patroni/
+
+# Nodes allowed to reach the control plane's client port (UFW source scoping).
+dcs_client_ips: []
+
+dcs_etcdctl_bin: etcdctl
+
+# ── Derived ─────────────────────────────────────────────────────────────────
+# The single prefix that defines this tenant: its Patroni keys, the RBAC grant,
+# and what cleanup deletes all come from here, so they cannot drift apart.
+dcs_prefix: "{{ dcs_namespace }}{{ dcs_scope }}/"
+dcs_tenant_user: "patroni-{{ dcs_scope }}-user"
+dcs_tenant_role: "patroni-{{ dcs_scope }}-role"
+
+# etcdctl reads all of its connection settings from the environment, which
+# keeps the root credential out of argv (visible in `ps` on the control plane)
+# and out of the Ansible command string. Every task that uses it is no_log for
+# the same reason — the -vvv this project runs with would otherwise print the
+# whole environment dict.
+dcs_etcdctl_env:
+  ETCDCTL_API: "3"
+  ETCDCTL_ENDPOINTS: "https://{{ dcs_endpoint_ip }}:{{ dcs_client_port }}"
+  ETCDCTL_CACERT: "{{ dcs_ca_file }}"
+  ETCDCTL_CERT: "{{ dcs_cert_file }}"
+  ETCDCTL_KEY: "{{ dcs_key_file }}"
+  ETCDCTL_USER: "{{ dcs_root_user }}:{{ dcs_root_password }}"
+  DCS_ROLE: "{{ dcs_tenant_role }}"
+  DCS_USER: "{{ dcs_tenant_user }}"
+  DCS_PREFIX: "{{ dcs_prefix }}"
+  DCS_PASSWORD: "{{ dcs_tenant_password | default('') }}"

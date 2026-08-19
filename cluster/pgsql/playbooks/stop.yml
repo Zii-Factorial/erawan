@@ -78,7 +78,12 @@
   become: true
   any_errors_fatal: true
   tasks:
+    # Skipped when the DCS lives on the shared control plane: there is no local
+    # etcd, and the control plane's own etcd serves every other tenant — a stop
+    # of THIS cluster must never touch it. Patroni shutting down cleanly above
+    # is what releases this cluster's leader key.
     - name: Stop etcd
       ansible.builtin.systemd:
         name: etcd
         state: stopped
+      when: not (erawan_dcs_control_plane | bool)

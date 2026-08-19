@@ -1,0 +1,115 @@
+---
+# Drops one tenant from the shared control-plane etcd: its keys, its user and
+# its role, in that order (deleting the role first would leave the user with a
+# dangling grant if a later step failed).
+#
+# This is the counterpart of provision.yml and the reason it exists: a cluster
+# whose VMs are destroyed leaves its Patroni keys, user and role behind on a
+# control plane that every other tenant shares, and the names are derived from
+# the cluster name — so a tenant name reused later would inherit them.
+#
+# Every step tolerates "already gone": cleanup is routinely run after a partly
+# finished deploy, or twice.
+
+- name: Delete the tenant keys, user and role from the control plane
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    # --prefix is bounded by dcs_prefix, which main.yml validated: it always
+    # ends in /<scope>/ and can never widen to the shared namespace itself.
+    # etcdctl prints the number of keys it removed; distinguishing zero from
+    # some is what keeps a repeat cleanup from reporting a change every time.
+    deleted="$({{ dcs_etcdctl_bin }} del --prefix "$DCS_PREFIX" | tr -dc '0-9')"
+    if [ "${deleted:-0}" -gt 0 ]; then
+      echo "keys-deleted $deleted"
+    else
+      echo "keys-absent"
+    fi
+
+    if {{ dcs_etcdctl_bin }} user list | grep -Fxq "$DCS_USER"; then
+      {{ dcs_etcdctl_bin }} user delete "$DCS_USER" >/dev/null
+      echo "user-deleted $DCS_USER"
+    fi
+
+    if {{ dcs_etcdctl_bin }} role list | grep -Fxq "$DCS_ROLE"; then
+      {{ dcs_etcdctl_bin }} role delete "$DCS_ROLE" >/dev/null
+      echo "role-deleted $DCS_ROLE"
+    fi
+
+    echo "ok $DCS_PREFIX"
+  args:
+    executable: /bin/bash
+  environment: "{{ dcs_etcdctl_env }}"
+  register: _dcs_cleanup
+  changed_when: "'-deleted ' in (_dcs_cleanup.stdout | default(''))"
+  failed_when: false
+  no_log: true
+
+- name: Fail with the control-plane etcd error
+  ansible.builtin.fail:
+    msg: |
+      Removing the tenant namespace {{ dcs_prefix }} from the shared
+      control-plane etcd ({{ dcs_endpoint_ip }}:{{ dcs_client_port }}) failed.
+      etcdctl stderr: {{ _dcs_cleanup.stderr | default('(none)') | trim }}
+      etcdctl stdout: {{ _dcs_cleanup.stdout | default('(none)') | trim }}
+  when: (_dcs_cleanup.rc | default(1)) != 0
+
+- name: Report what was removed
+  ansible.builtin.debug:
+    msg: "{{ (_dcs_cleanup.stdout | default('')).splitlines() }}"
+
+# The tenant's client certificate goes with the tenant. Left behind it would
+# stay valid until its expiry, and a cluster later created under the same name
+# would adopt it on its next provisioning run rather than being issued its own.
+#
+# Every pair the tenant ever held is removed, not just the current one: a mint
+# stamps the pair with the time it issued it, so a tenant that was re-issued at
+# some point (a CN certificate retired, a rotation done by hand) has more than
+# one, and naming only the newest would strand the rest.
+#
+# The pattern is anchored on the whole stem — "<cluster>-user-" — which is what
+# makes matching safe here. A bare glob on the cluster name would also catch a
+# different cluster whose name merely starts with this one (db-2 inside db-20),
+# and deleting a live cluster's certificate is far worse than leaving a dead one
+# behind; the "-user-" that follows the name can only end this tenant's stem.
+- name: Find every client certificate this tenant holds
+  ansible.builtin.find:
+    paths: "{{ dcs_client_cert_dir }}"
+    patterns: "{{ dcs_client_cert_prefix }}-*.pem"
+    file_type: file
+  register: _dcs_tenant_certs
+
+- name: Remove the tenant client certificates from the control plane
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ (_dcs_tenant_certs.files | default([]) | map(attribute='path') | list) + [
+         dcs_client_cert_dir ~ '/' ~ dcs_client_cert_prefix ~ '.pem',
+         dcs_client_cert_dir ~ '/' ~ dcs_client_cert_prefix ~ '-key.pem',
+         dcs_client_cert_dir ~ '/' ~ dcs_tenant_user ~ '.pem',
+         dcs_client_cert_dir ~ '/' ~ dcs_tenant_user ~ '-key.pem',
+         dcs_client_cert_dir | dirname ~ '/' ~ dcs_tenant_user ~ '.pem',
+         dcs_client_cert_dir | dirname ~ '/' ~ dcs_tenant_user ~ '-key.pem' ] }}
+
+- name: Check UFW availability and status on the control plane
+  ansible.builtin.command:
+    argv: [ufw, status]
+  register: _dcs_ufw_status
+  changed_when: false
+  failed_when: false
+
+# Node IPs get recycled by CloudStack, so leaving these behind would hand a
+# later, unrelated VM access to the control plane's client port.
+- name: Revoke the tenant's nodes from the control-plane client port
+  community.general.ufw:
+    rule: allow
+    port: "{{ dcs_client_port | string }}"
+    proto: tcp
+    src: "{{ item }}"
+    delete: true
+  loop: "{{ dcs_client_ips | default([], true) | unique }}"
+  when:
+    - _dcs_ufw_status.rc == 0
+    - "'Status: active' in (_dcs_ufw_status.stdout | default(''))"
+  failed_when: false
