@@ -11,11 +11,16 @@ per-tenant roles, users, key prefixes, client certificates and firewall grants �
 nothing else. Standing up etcd, its TLS material, the root user and `auth
 enable` is this document.
 
-A cloud-init that does most of it is in the repo:
-[`cluster/shared/cloudinit/etcd-control-plane.yml`](../cluster/shared/cloudinit/etcd-control-plane.yml).
-It cannot do the CA, because a host that mints its own CA on boot would orphan
-every certificate already issued to a running tenant. So the order is: make the
-CA (step 1), put it on the VM (step 2), boot (step 3).
+Steps 1–9 below build one by hand, in order. Everything after them is optional:
+a [cloud-init](#doing-it-at-boot-instead-the-cloud-init) that does the same work
+at boot for a VM that gets rebuilt or cloned, and the operational notes —
+[golden images](#building-a-golden-image),
+[more members](#adding-more-control-plane-members),
+[rotation](#rotation), [troubleshooting](#troubleshooting).
+
+**Run every command as root** (`sudo -i`). Most of the files live in
+`/etc/etcd/ssl`, which is not writable by a normal user, so a half-`sudo`'d
+paste fails partway through.
 
 ## What you end up with
 
@@ -34,55 +39,66 @@ CA (step 1), put it on the VM (step 2), boot (step 3).
 The member name is not cosmetic: it names the server certificate, and erawan
 reads that certificate by path. `CONTROL_PLANE_ETCD_CERT` / `_KEY` default to
 `cp-etcd-01{,-key}.pem`, so either the host is called `cp-etcd-01` or you set
-the name on both sides (`ETCD_NODE_NAME` in `/etc/etcd/regen.env`, and the two
-erawan variables).
+the name on both sides.
 
 ## Prerequisites
 
 - **A VM with etcd 3.4.** Ubuntu 24.04 packages `etcd-server`
   `3.4.30-1ubuntu0.24.04.3` — the version the four requirements in
-  [pgsql.md](pgsql.md#configuring-the-control-plane) were verified against, and
-  what the cloud-init assumes. Older Ubuntu LTS releases ship the 3.3 series,
-  which nothing here is tested against.
+  [pgsql.md](pgsql.md#configuring-the-control-plane) were verified against.
+  Older Ubuntu LTS releases ship the 3.3 series, which nothing here is tested
+  against.
 - **Network.** DB nodes reach `2379`; erawan opens that port per tenant with UFW
   during provisioning, scoped to the tenant's node addresses. `2380` is needed
   only between control-plane members. Nothing needs to be public.
-- **SSH from the erawan host as root** (or a user that can read
-  `/etc/etcd/ssl/ca-key.pem` and run `etcdctl`). It defaults to the cluster SSH
-  credentials; `CONTROL_PLANE_SSH_USER` / `_PRIVATE_KEY_PATH` / `_PORT`
-  override. Provisioning runs `etcdctl` and signs tenant certificates *on this
-  host* — the CA key never leaves it.
+- **SSH from the erawan host.** The provisioning playbooks run with
+  `become: true`, so they operate as root on this host: they run `etcdctl` and
+  sign tenant certificates *here*, and the CA key never leaves the machine.
+  Credentials default to the cluster's own SSH key;
+  `CONTROL_PLANE_SSH_USER` / `_PRIVATE_KEY_PATH` / `_PORT` override.
 - **Decide the failure domain first.** Patroni's `ttl` is 30s, so a control
   plane down longer than that costs **every** tenant its leader lock and demotes
   every primary to read-only until it returns. One member is fine for a lab and
   is a shared single point of failure in production; see
-  [multi-member](#adding-more-control-plane-members) below for what erawan does
-  and does not do with more than one.
+  [more members](#adding-more-control-plane-members) for what erawan does and
+  does not do with more than one.
 
-## Step 1 — Create the CA
+## Step 1 — Install etcd and the certificate tooling
+
+```bash
+apt update
+apt install -y etcd-server etcd-client golang-cfssl gettext-base
+
+# The package auto-starts etcd with its own defaults, which are not the ones
+# below. Stop it before it writes any state.
+systemctl stop etcd
+
+mkdir -p /etc/etcd/ssl /var/lib/etcd
+cd /etc/etcd/ssl
+```
+
+`golang-cfssl` provides `cfssl` and `cfssljson`. `gettext-base` (for `envsubst`)
+is only used by the [cloud-init](#doing-it-at-boot-instead-the-cloud-init); it
+does no harm here.
+
+## Step 2 — Create the CA
 
 Once, on the first control plane. Everything on every control plane — server
 certificates and every tenant certificate erawan ever mints — is signed by this
 one CA, so a second control-plane host gets a *copy* of these three files, never
 its own CA.
 
-```bash
-apt-get install -y golang-cfssl
-mkdir -p /etc/etcd/ssl && cd /etc/etcd/ssl
-```
-
-The signing profile first. The `client auth` usage in the **server** profile is
-the load-bearing part and the easiest thing to leave out:
+The signing profile first. It is reusable for every certificate you sign later:
 
 ```bash
 cat > ca-config.json <<'EOF'
 {
   "signing": {
-    "default": { "expiry": "87600h" },
+    "default": {"expiry": "87600h"},
     "profiles": {
       "server": {
         "expiry": "87600h",
-        "usages": ["signing", "key encipherment", "server auth", "client auth"]
+        "usages": ["signing","key encipherment","server auth","client auth"]
       }
     }
   }
@@ -90,144 +106,172 @@ cat > ca-config.json <<'EOF'
 EOF
 ```
 
-Under `client-cert-auth: true` the gRPC JSON gateway dials etcd's own gRPC
-listener **as a client**, presenting this same certificate. A server certificate
-without `clientAuth` therefore answers every `/v3` request with HTTP 503
+`"client auth"` in the **server** profile is the load-bearing part and the
+easiest thing to leave out. Under `client-cert-auth: true` the gRPC JSON gateway
+dials etcd's own gRPC listener *as a client*, presenting this same certificate.
+Without `clientAuth` every `/v3` request answers HTTP 503
 `error reading server preface: remote error: tls: bad certificate`, while
 `etcdctl` and `/version` keep working — see
 [pgsql.md requirement 3](pgsql.md#3-the-control-planes-server-certificate-needs-clientauth).
 
-Then the CA itself:
+Then the CA identity, and the CA itself:
 
 ```bash
 cat > ca-csr.json <<'EOF'
 {
-  "CN": "erawan-etcd-ca",
-  "key": { "algo": "rsa", "size": 2048 },
-  "names": [ { "O": "erawan" } ],
-  "ca": { "expiry": "175200h" }
+  "CN": "etcd-ca",
+  "key": {"algo": "rsa", "size": 2048},
+  "ca": {"expiry": "175200h"}
 }
 EOF
 
+# ca.pem = public (goes everywhere), ca-key.pem = private (stays here)
 cfssl gencert -initca ca-csr.json | cfssljson -bare ca
-rm -f ca.csr ca-csr.json
-
-chmod 600 ca-key.pem
-chmod 644 ca.pem ca-config.json
 ```
 
-`cfssl gencert -initca` writes `ca.pem` and `ca-key.pem` (and a `ca.csr` that is
-of no further use). The CA expiry is deliberately longer than the certificates
-it signs: a CA that expires under live tenants invalidates all of them at once.
+The `ca.expiry` line is worth keeping. Left out, cfssl gives the CA its own
+default lifetime (5 years) while the profile above signs leaf certificates for
+10 — and erawan mints tenant certificates for 3650 days by default. A CA that
+expires before the certificates it signed takes every tenant down on that date,
+so check what yours actually got, especially on a CA created earlier:
+
+```bash
+openssl x509 -in ca.pem -noout -subject -dates
+```
 
 | File | Who needs it |
 |---|---|
 | `ca.pem` | etcd, erawan, and every DB node (installed as `/etc/patroni/etcd-ca.pem`) |
 | `ca-key.pem` | This host only. Erawan signs tenant certificates with it **in place, over SSH** — it is never copied to a node or to the erawan host |
-| `ca-config.json` | Only the host that signs server certificates (the boot-time re-sign in step 3 uses it) |
+| `ca-config.json` | Only the host that signs certificates |
 
-The same three files are what
-`/usr/local/sbin/etcd-make-ca.sh` writes if you would rather run one command on
-a VM the cloud-init has already built. It refuses to overwrite an existing CA.
+## Step 3 — Sign the server certificate
 
-## Step 2 — Put the CA on the VM
-
-The boot-time configuration in step 3 fails by name when these files are
-missing, so pick one of:
-
-1. **Bake it into the image.** Place the three files in `/etc/etcd/ssl` on the
-   template VM and snapshot it (see [sealing](#building-a-golden-image) — an
-   image with leftover etcd data will refuse to start). Every clone comes up
-   fully configured with no manual step. This is the flow the cloud-init is
-   written for.
-2. **Copy it in after the first boot.** Let cloud-init run, `scp` the files to
-   `/etc/etcd/ssl`, then:
-
-   ```bash
-   systemctl restart etcd-regen-config.service
-   ```
-
-   The first boot's failure is expected on this path and does not fail the rest
-   of cloud-init.
-
-**Do not paste the CA key into the cloud-init user-data.** `write_files` with a
-base64 CA key works, but user-data is readable from the instance metadata
-service by anything running on the VM and is usually retained by the hypervisor
-— that is the CA for every tenant certificate on the platform.
-
-## Step 3 — Boot the VM with the cloud-init
-
-Pass [`cluster/shared/cloudinit/etcd-control-plane.yml`](../cluster/shared/cloudinit/etcd-control-plane.yml)
-as user-data. On first boot it installs `etcd-server`, `etcd-client` and
-`golang-cfssl`, then runs `/usr/local/sbin/etcd-regen-config.sh`, which:
-
-1. detects the private IP (`ip route get 1.1.1.1`),
-2. signs `/etc/etcd/ssl/<name>.pem` for that IP with `-profile=server`, carrying
-   SANs for the node name, the detected IP, `127.0.0.1` and `localhost` (plus
-   any SANs the previous certificate had),
-3. renders `/etc/etcd/etcd.conf.yml` from `/etc/etcd/etcd.conf.yml.j2`,
-4. drops `/var/lib/etcd/default` — the member directory the package's own
-   auto-start leaves behind, which is never this node's real state, and
-5. starts etcd.
-
-It is idempotent and re-runnable (`systemctl restart etcd-regen-config.service`),
-logs everything to `/var/log/etcd-regen-config.log`, and skips its work on a
-reboot at an address it has already configured
-(`/etc/etcd/.regen-done-<ip>` marks it).
-
-Because the address is detected rather than configured, a clone of a sealed
-image comes up correctly on whatever IP it is given — which is what makes this
-survivable on a platform that hands out a new address every time a VM is
-rebuilt.
-
-The one thing it will not do is delete a **bootstrapped** member directory
-(`/var/lib/etcd/member`) to make a new address work. That data is every tenant's
-Patroni state, every etcd user and role, and the `auth enable` flag; erasing it
-to clear a startup error would take out every cluster on the platform at once.
-It stops with instructions instead — see
-[troubleshooting](#troubleshooting).
-
-Then continue at step 6. Steps 4 and 5 are for a host you are configuring by
-hand.
-
-## Step 4 — Sign the server certificate by hand
-
-Only if you are not using the cloud-init. Same profile, same SANs:
+Change `CN` and `hosts` to the real node. The IP is not optional: Patroni
+verifies the server certificate against **the IP it dials**, and the node-side
+check erawan runs fails by name on a missing SAN rather than letting the cluster
+start and fail every DCS call later. `127.0.0.1` matters for the same reason —
+it is the address the gateway itself dials.
 
 ```bash
-cd /etc/etcd/ssl
 cat > cp-etcd-01-csr.json <<'EOF'
 {
   "CN": "cp-etcd-01",
   "hosts": ["cp-etcd-01", "10.10.3.66", "127.0.0.1", "localhost"],
-  "key": { "algo": "rsa", "size": 2048 }
+  "key": {"algo": "rsa", "size": 2048}
 }
 EOF
 
-cfssl gencert \
-  -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server \
+cfssl gencert -ca=ca.pem -ca-key=ca-key.pem \
+  -config=ca-config.json -profile=server \
   cp-etcd-01-csr.json | cfssljson -bare cp-etcd-01
 
-rm -f cp-etcd-01.csr cp-etcd-01-csr.json
-chown root:etcd cp-etcd-01.pem cp-etcd-01-key.pem
-chmod 644 cp-etcd-01.pem
-chmod 640 cp-etcd-01-key.pem
+# Keep: ca.pem, ca-key.pem, ca-config.json, cp-etcd-01.pem, cp-etcd-01-key.pem
+rm -f *.csr *-csr.json
 ```
 
-The IP in `hosts` is not optional: Patroni verifies the server certificate
-against **the IP it dials**, and the node-side check erawan runs fails by name
-on a missing SAN rather than letting the cluster start and fail every DCS call
-later.
+## Step 4 — Set the file permissions
 
-Write `/etc/etcd/etcd.conf.yml` from the reference config in
-[pgsql.md](pgsql.md#reference-etcetcdetcdconfyml) — or copy the template out of
-the cloud-init — and make sure `enable-grpc-gateway: true` is really in it. etcd
-defaults that flag to `true` on the command line and **`false`** under
-`--config-file`, and nothing warns you: `/version` and `etcdctl` answer either
-way, while Patroni gets `404 page not found` and dies on
-`AttributeError: 'int' object has no attribute 'get'`.
+```bash
+chown etcd:etcd /etc/etcd/ssl/*
+chmod 644 /etc/etcd/ssl/*.pem
+chmod 600 /etc/etcd/ssl/*-key.pem     # after the 644 — key files match *.pem too
+```
 
-## Step 5 — Verify the certificate
+Two tightenings worth making, neither of which breaks anything:
+
+```bash
+# etcd never reads the CA key; only erawan does, and it operates as root.
+chown root:root /etc/etcd/ssl/ca-key.pem && chmod 600 /etc/etcd/ssl/ca-key.pem
+
+# Once erawan has minted tenant certificates here (they are live credentials
+# for other people's clusters):
+chown -R root:root /etc/etcd/ssl/erawan-clients && chmod 700 /etc/etcd/ssl/erawan-clients
+```
+
+Left as `etcd:etcd`, a compromise of the etcd service account is a compromise of
+the CA and of every tenant credential ever issued from it. Note also that
+re-running the wildcard `chown` later re-takes the `erawan-clients` directory
+for the etcd user — which is why the cloud-init sets ownership per file instead
+of sweeping the directory.
+
+## Step 5 — Write `/etc/etcd/etcd.conf.yml`
+
+```yaml
+name: cp-etcd-01
+data-dir: /var/lib/etcd
+
+listen-peer-urls: https://10.10.3.66:2380
+listen-client-urls: https://10.10.3.66:2379,https://127.0.0.1:2379
+
+initial-advertise-peer-urls: https://10.10.3.66:2380
+advertise-client-urls: https://10.10.3.66:2379
+
+initial-cluster: cp-etcd-01=https://10.10.3.66:2380
+initial-cluster-state: new
+initial-cluster-token: erawan-shared-cp
+
+# Load-bearing, and NOT the default here — see below.
+enable-grpc-gateway: true
+
+client-transport-security:
+  cert-file: /etc/etcd/ssl/cp-etcd-01.pem
+  key-file: /etc/etcd/ssl/cp-etcd-01-key.pem
+  trusted-ca-file: /etc/etcd/ssl/ca.pem
+  client-cert-auth: true
+
+peer-transport-security:
+  cert-file: /etc/etcd/ssl/cp-etcd-01.pem
+  key-file: /etc/etcd/ssl/cp-etcd-01-key.pem
+  trusted-ca-file: /etc/etcd/ssl/ca.pem
+  peer-client-cert-auth: true
+```
+
+**`enable-grpc-gateway: true` is the single most missable line in this
+document.** Patroni speaks etcd v3 over HTTP (`POST /v3/...`), and those paths
+exist only when the gateway is on. etcd defaults it to `true` for command-line
+flags but **`false`** under `--config-file`, which is how this host starts — so
+a config file that merely omits the key serves no `/v3` at all. Nothing warns
+you: `/version` answers, `etcdctl` works (it speaks gRPC on the same port), and
+erawan provisions the tenant successfully. Then every Patroni call gets a
+plain-text `404 page not found`, which Patroni JSON-decodes into the integer
+`404` and dies on `AttributeError: 'int' object has no attribute 'get'`.
+
+The loopback entry in `listen-client-urls` is what the gateway dials when it
+proxies an inbound request to etcd's own gRPC listener. Keep it.
+
+## Step 6 — Start etcd from that config
+
+The packaged unit starts etcd from `/etc/default/etcd` with flags and
+environment. Point it at the config file instead — and clear the environment the
+package sets, so the two cannot read as if both applied:
+
+```bash
+mkdir -p /etc/systemd/system/etcd.service.d
+
+tee /etc/systemd/system/etcd.service.d/override.conf > /dev/null <<'EOF'
+[Service]
+Environment=
+ExecStart=
+ExecStart=/usr/bin/etcd --config-file=/etc/etcd/etcd.conf.yml
+EOF
+
+systemctl stop etcd
+# State from the package's own auto-start, under the name and defaults it used.
+# Left in place it collides with the member this config bootstraps.
+rm -rf /var/lib/etcd/default
+systemctl daemon-reload
+systemctl enable --now etcd
+systemctl status etcd
+```
+
+`rm -rf /var/lib/etcd/default` is safe **only** because that directory is the
+package's, never this member's: the config above keeps its state in
+`/var/lib/etcd/member`. Once the control plane is live, never clear that one to
+fix a startup error — it holds every tenant's Patroni state, every etcd user and
+role, and the `auth enable` flag.
+
+## Step 7 — Verify the certificate and the gateway
 
 ```bash
 openssl x509 -in /etc/etcd/ssl/cp-etcd-01.pem -noout -ext extendedKeyUsage -ext subjectAltName
@@ -242,11 +286,33 @@ X509v3 Subject Alternative Name:
     DNS:cp-etcd-01, DNS:localhost, IP Address:10.10.3.66, IP Address:127.0.0.1
 ```
 
-A missing `TLS Web Client Authentication` is a `ca-config.json` without
-`"client auth"` in the server profile (step 1), and re-signing is the fix —
-fixing the profile alone changes nothing already issued.
+A missing `TLS Web Client Authentication` means `ca-config.json` had no
+`"client auth"` in the server profile. Fixing the profile changes nothing
+already issued — re-sign (step 3) and restart etcd.
 
-## Step 6 — Create the root user and enable RBAC
+Then the gateway. `curl https://10.10.3.66:2379/version` is **not** the test: it
+is answered by etcd's own HTTP handler and stays green even when the API Patroni
+uses is entirely unavailable. Use a `/v3` path:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  --cacert /etc/etcd/ssl/ca.pem \
+  --cert /etc/etcd/ssl/cp-etcd-01.pem \
+  --key /etc/etcd/ssl/cp-etcd-01-key.pem \
+  -X POST https://10.10.3.66:2379/v3/auth/authenticate -d '{}'
+```
+
+| Code | Meaning |
+|---|---|
+| `404` | Gateway off. Fix `enable-grpc-gateway` (step 5) and restart etcd |
+| `400` | Gateway **live**. This is the CN guard firing on the server certificate's own CommonName, which is expected here — tenant certificates are minted without one |
+| `503` | Server certificate has no `clientAuth` |
+
+Erawan re-runs the equivalent check from every DB node on every deploy,
+start/recover and add-member, and fails the job with the cause named — so this
+is a pre-flight, not the only line of defence.
+
+## Step 8 — Create the root user and enable RBAC
 
 Prefix-scoped RBAC is the only thing keeping tenants off each other's keys.
 Erawan creates per-tenant roles and users but never runs `auth enable`, on
@@ -270,31 +336,7 @@ off and deploys still succeed — Patroni tolerates it, and the provisioning ste
 only warns — but every tenant can then read and write every other tenant's
 Patroni state.
 
-## Step 7 — Prove the gateway is serving
-
-The obvious smoke test (`curl https://10.10.3.66:2379/version`) is answered by
-etcd's own HTTP handler and stays green even when the API Patroni uses is
-entirely unavailable. Use the v3 path instead:
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' \
-  --cacert /etc/etcd/ssl/ca.pem \
-  --cert /etc/etcd/ssl/cp-etcd-01.pem \
-  --key /etc/etcd/ssl/cp-etcd-01-key.pem \
-  -X POST https://10.10.3.66:2379/v3/auth/authenticate -d '{}'
-```
-
-| Code | Meaning |
-|---|---|
-| `404` | Gateway off. Fix `enable-grpc-gateway` and restart etcd |
-| `400` | Gateway **live**. This is the CN guard firing on the server certificate's own CommonName, which is expected here — tenant certificates are minted without one |
-| `503` | Server certificate has no `clientAuth` (step 5) |
-
-Erawan re-runs the equivalent check from every DB node on every deploy,
-start/recover and add-member, and fails the job with the cause named — so this
-is a pre-flight, not the only line of defence.
-
-## Step 8 — Point erawan at it
+## Step 9 — Point erawan at it
 
 On the erawan host (`.envrc` / the service environment):
 
@@ -319,6 +361,56 @@ Existing clusters are never migrated: each job records the DCS layout it was
 deployed with, so setting this variable cannot re-point a cluster that is
 already running its own etcd.
 
+## Doing it at boot instead — the cloud-init
+
+[`cluster/shared/cloudinit/etcd-control-plane.yml`](../cluster/shared/cloudinit/etcd-control-plane.yml)
+performs steps 1, 3, 5 and 6 automatically, against **the IP the VM actually
+boots with**. That is the difference that matters on a platform where a rebuilt
+or cloned VM comes back on a different address: the certificate from step 3 is
+pinned to an IP, so a hand-built host stops serving the moment its address
+changes, while a cloud-init host re-signs itself and comes up.
+
+It cannot do step 2. A host that mints its own CA on boot would orphan every
+certificate already issued to a running tenant, so the CA must be there first —
+either baked into the image (the intended flow, see
+[golden images](#building-a-golden-image)) or copied in afterwards:
+
+```bash
+scp ca.pem ca-key.pem ca-config.json root@<vm>:/etc/etcd/ssl/
+ssh root@<vm> systemctl restart etcd-regen-config.service
+```
+
+The first boot's failure on a missing CA is expected on that path and does not
+fail the rest of cloud-init.
+
+**Do not paste the CA key into the user-data.** `write_files` with a base64 key
+works, but user-data is readable from the instance metadata service by anything
+running on the VM and is usually retained by the hypervisor — that is the CA for
+every tenant certificate on the platform.
+
+What `/usr/local/sbin/etcd-regen-config.sh` does on each boot:
+
+1. detects the private IP (`ip route get 1.1.1.1`),
+2. signs `/etc/etcd/ssl/<name>.pem` for it with `-profile=server`, carrying SANs
+   for the node name, that IP, `127.0.0.1` and `localhost` (plus any the
+   previous certificate had),
+3. renders `/etc/etcd/etcd.conf.yml` from `/etc/etcd/etcd.conf.yml.j2`,
+4. removes the package's `/var/lib/etcd/default`, and
+5. starts etcd.
+
+It logs to `/var/log/etcd-regen-config.log`, skips its work on a reboot at an
+address it has already configured (`/etc/etcd/.regen-done-<ip>`), and is
+re-runnable with `systemctl restart etcd-regen-config.service`. Node name,
+cluster membership and token come from `/etc/etcd/regen.env`; the defaults are
+the hostname and a single-member cluster.
+
+The one thing it will not do is delete a bootstrapped `/var/lib/etcd/member` to
+make a new address work — see [troubleshooting](#troubleshooting).
+
+A CA can also be created on such a VM with `/usr/local/sbin/etcd-make-ca.sh`,
+which runs step 2 exactly as written above and refuses to overwrite an existing
+CA. It is never called at boot.
+
 ## Building a golden image
 
 The regen script refuses to delete bootstrapped etcd data, so a template must
@@ -336,9 +428,9 @@ Keep `ca.pem`, `ca-key.pem` and `ca-config.json` — inheriting the CA is the
 point of the image. Every clone then signs itself a fresh certificate for its
 own address on first boot.
 
-If the image is also meant to carry tenant material (it should not), clear
+If the image carries tenant material (it should not), clear
 `/etc/etcd/ssl/erawan-clients/` too: those are live credentials for clusters
-that belong to the machine you cloned.
+belonging to the machine you cloned.
 
 ## Adding more control-plane members
 
@@ -351,8 +443,8 @@ etcdctl --user "root:<root-pw>" member add cp-etcd-02 \
   --peer-urls=https://10.10.3.67:2380
 ```
 
-Then, on the new VM before its first `etcd-regen-config` run (bake it into the
-image's `/etc/etcd/regen.env`, or write it and re-run the service):
+Then, on the new VM — in `/etc/etcd/regen.env` before its first regen run, or
+directly in its `etcd.conf.yml` if you are building it by hand:
 
 ```bash
 ETCD_NODE_NAME=cp-etcd-02
@@ -378,7 +470,7 @@ Two limits worth knowing before you build three of these:
 |---|---|---|
 | One tenant's certificate | Delete the pair under `/etc/etcd/ssl/erawan-clients/<engine>/` and re-run any deploy, start/recover or add-member for that cluster. The next run mints a new pair (stamped with the issue time) and installs it | That tenant |
 | One tenant's password | Rotate on the erawan side; provisioning converges the etcd user's password on the next run | That tenant |
-| Server certificate | Delete `/etc/etcd/ssl/<name>.pem`, `-key.pem` and `/etc/etcd/.regen-done-*`, run `systemctl restart etcd-regen-config.service` | etcd restarts — a few seconds of DCS outage for every tenant. Patroni's `ttl` is 30s, so time it deliberately |
+| Server certificate | Re-sign (step 3) and `systemctl restart etcd` — or, on a cloud-init host, delete `/etc/etcd/ssl/<name>.pem`, `-key.pem` and `/etc/etcd/.regen-done-*` and restart `etcd-regen-config.service` | etcd restarts — a few seconds of DCS outage for every tenant. Patroni's `ttl` is 30s, so time it deliberately |
 | CA | Effectively a rebuild: every server and tenant certificate signed by it stops being trusted, and nodes hold the old `ca.pem` until their next provisioning run | Everything |
 
 Any change to `/etc/etcd/etcd.conf.yml` also needs an etcd restart, with the
@@ -391,15 +483,16 @@ indexed in [pgsql.md → Symptom index](pgsql.md#symptom-index). Control-plane-s
 
 | Seen on the control plane | Cause |
 |---|---|
-| `etcd-regen-config.service` failed, log says `CA files ... not found` | Step 2 — the CA is not on the VM yet. Copy it in and re-run the service |
-| Log says `/var/lib/etcd/member exists, but this node's certificate had to be re-signed` | Either a clone of an unsealed image (seal it: [above](#building-a-golden-image), then re-run the service), or a live control plane whose IP changed — in which case do **not** wipe: restore the old address, or recover deliberately with `etcdctl member update` or a snapshot restore |
-| `etcd.service` fails with `member ... has already been bootstrapped` | Same cause: leftover data from another incarnation |
-| `cfssl: command not found` in the log | `apt-get install -y golang-cfssl` |
-| `curl .../v3/auth/authenticate` returns `404` | `enable-grpc-gateway` is off or the config file was not the one etcd started with (`systemctl cat etcd`) |
-| Provisioning warns `authentication is not enabled` | Step 6 was skipped |
+| `curl .../v3/auth/authenticate` returns `404` | `enable-grpc-gateway` is off, or etcd did not start from the config file you edited (`systemctl cat etcd`, and check the `--config-file` override is in effect) |
+| `etcd.service` fails with `member ... has already been bootstrapped` | Leftover data in `/var/lib/etcd` from another incarnation — the package's auto-start (`/var/lib/etcd/default`, safe to delete) or a cloned image (see below) |
+| `etcd-regen-config.service` failed, log says `CA files ... not found` | The CA is not on the VM yet — copy it in and restart the service |
+| Log says `/var/lib/etcd/member exists, but this node's certificate had to be re-signed` | Either a clone of an unsealed image (seal it: [above](#building-a-golden-image), then restart the service), or a live control plane whose IP changed — in which case do **not** wipe: restore the old address, or recover deliberately with `etcdctl member update` or a snapshot restore |
+| `cfssl: command not found` | `apt install -y golang-cfssl` |
+| Provisioning warns `authentication is not enabled` | Step 8 was skipped |
 | Provisioning fails on `invalid user ID or password` for root | `CONTROL_PLANE_ETCD_ROOT_PASSWORD` does not match this host's root user |
+| Nodes fail with `certificate verify failed` / IP mismatch | The server certificate has no SAN for the address the node dials — re-sign (step 3) |
 
-Useful reads: `/var/log/etcd-regen-config.log`, `journalctl -u etcd -n 100`,
-`systemctl cat etcd` (confirms the `--config-file` override is in effect), and
+Useful reads: `journalctl -u etcd -n 100`, `systemctl cat etcd`,
+`/var/log/etcd-regen-config.log`, and
 `etcdctl --user "root:<pw>" user list` / `role list` for what erawan has
 provisioned.

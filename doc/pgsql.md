@@ -366,10 +366,11 @@ deletes per-tenant roles, users, key prefixes and firewall grants, and nothing
 else. Standing up the host — etcd, TLS material, the root user, `auth enable` —
 is yours. Erawan reaches it over SSH with the cluster's own key by default.
 
-[control-plane.md](control-plane.md) builds one step by step — CA generation, a
-self-configuring cloud-init, RBAC set-up, verification and image sealing. What
-follows here is the four requirements those steps satisfy, and what each one
-looks like when it is missing.
+[control-plane.md](control-plane.md) builds one step by step — etcd install, CA
+and certificate generation, the TLS config, RBAC set-up and verification, plus a
+cloud-init that does the same at boot. What follows here is the four
+requirements those steps satisfy, and what each one looks like when it is
+missing.
 
 Four requirements below are load-bearing, and none of them is caught by the
 obvious `curl https://<cp>:2379/version` smoke test — that endpoint is served by
