@@ -17,9 +17,9 @@ Steps 1–9 below build one, in order. After them come the operational notes:
 [changing its IP](#changing-the-control-planes-private-ip), [rotation](#rotation)
 and [troubleshooting](#troubleshooting).
 
-**Run every command as root** (`sudo -i`). Most of the files live in
-`/etc/etcd/ssl`, which is not writable by a normal user, so a half-`sudo`'d
-paste fails partway through.
+**Run every command as root** (`sudo -i`). The files live in
+`/root/pki/etcd-ca` and `/etc/etcd/ssl`, neither of which a normal user can
+write, so a half-`sudo`'d paste fails partway through.
 
 ## What you end up with
 
@@ -29,11 +29,26 @@ paste fails partway through.
 | Private IP | `10.10.3.66` |
 | Client port (DB nodes, erawan) | `2379` |
 | Peer port (other control-plane members only) | `2380` |
-| CA | `/etc/etcd/ssl/{ca.pem,ca-key.pem,ca-config.json}` |
+| CA — signs everything, never leaves this host | `/root/pki/etcd-ca/{ca.pem,ca-key.pem,ca-config.json}` |
+| CA certificate etcd and the nodes trust | `/etc/etcd/ssl/ca.pem` — a copy of the one above |
 | Server certificate | `/etc/etcd/ssl/cp-etcd-01.pem` + `-key.pem` |
 | etcd config | `/etc/etcd/etcd.conf.yml` |
 | Tenant certificates (minted by erawan) | `/etc/etcd/ssl/erawan-clients/<engine>/` |
 | Tenant keys | `/db/patroni/<cluster>/` |
+
+The CA sits outside `/etc/etcd/ssl` deliberately. etcd never reads the CA key —
+only erawan does, over SSH, as root — so keeping it out of the directory the
+etcd service account owns means compromising that account does not compromise
+the CA or any credential ever issued from it. `/etc/etcd/ssl` ends up holding
+exactly what etcd itself opens: its own key pair and the public CA certificate.
+
+That choice has one consequence, and it is the one thing in this document that
+bites after everything looks fine: erawan looks for the CA key at
+`/etc/etcd/ssl/ca-key.pem` unless told otherwise, so `CONTROL_PLANE_ETCD_CA_KEY`
+becomes a required setting rather than an optional one (step 9). Left unset, the
+first deploy creates the cluster's etcd user and role, then fails with
+`/etc/etcd/ssl/ca-key.pem does not exist on the control plane, so a client
+certificate cannot be signed`.
 
 The member name is not cosmetic: it names the server certificate, and erawan
 reads that certificate by path. `CONTROL_PLANE_ETCD_CERT` / `_KEY` default to
@@ -77,8 +92,11 @@ apt install -y etcd-server etcd-client golang-cfssl gettext-base
 # below. Stop it before it writes any state.
 systemctl stop etcd
 
-mkdir -p /etc/etcd/ssl /var/lib/etcd
-cd /etc/etcd/ssl
+# Two directories: the CA's, which is root's alone, and etcd's, which holds
+# only what etcd reads. Everything in steps 2 and 3 is signed in the first.
+mkdir -p /etc/etcd/ssl /var/lib/etcd /root/pki/etcd-ca
+chmod 700 /root/pki/etcd-ca
+cd /root/pki/etcd-ca
 ```
 
 `golang-cfssl` provides `cfssl` and `cfssljson`, which sign everything in steps
@@ -129,7 +147,8 @@ cat > ca-csr.json <<'EOF'
 }
 EOF
 
-# ca.pem = public (goes everywhere), ca-key.pem = private (stays here)
+# ca.pem = public (copied out in step 3), ca-key.pem = private (never leaves
+# this directory)
 cfssl gencert -initca ca-csr.json | cfssljson -bare ca
 ```
 
@@ -143,11 +162,11 @@ so check what yours actually got, especially on a CA created earlier:
 openssl x509 -in ca.pem -noout -subject -dates
 ```
 
-| File | Who needs it |
-|---|---|
-| `ca.pem` | etcd, erawan, and every DB node (installed as `/etc/patroni/etcd-ca.pem`) |
-| `ca-key.pem` | This host only. Erawan signs tenant certificates with it **in place, over SSH** — it is never copied to a node or to the erawan host |
-| `ca-config.json` | Only the host that signs certificates |
+| File | Where it lives | Who needs it |
+|---|---|---|
+| `ca.pem` | Here, plus a copy at `/etc/etcd/ssl/ca.pem` | etcd, erawan, and every DB node (installed as `/etc/patroni/etcd-ca.pem`) |
+| `ca-key.pem` | `/root/pki/etcd-ca` only | Erawan alone. It signs tenant certificates with the key **in place, over SSH** — the key is never copied to a node, to the erawan host, or into `/etc/etcd/ssl` |
+| `ca-config.json` | `/root/pki/etcd-ca` only | Whoever signs a server certificate — step 3, and re-addressing later |
 
 ## Step 3 — Sign the server certificate
 
@@ -158,6 +177,8 @@ start and fail every DCS call later. `127.0.0.1` matters for the same reason —
 it is the address the gateway itself dials.
 
 ```bash
+cd /root/pki/etcd-ca
+
 cat > cp-etcd-01-csr.json <<'EOF'
 {
   "CN": "cp-etcd-01",
@@ -170,34 +191,46 @@ cfssl gencert -ca=ca.pem -ca-key=ca-key.pem \
   -config=ca-config.json -profile=server \
   cp-etcd-01-csr.json | cfssljson -bare cp-etcd-01
 
-# Keep: ca.pem, ca-key.pem, ca-config.json, cp-etcd-01.pem, cp-etcd-01-key.pem
+# Everything etcd reads, and nothing more. The CA key and the signing profile
+# stay behind in /root/pki/etcd-ca.
+cp ca.pem cp-etcd-01.pem cp-etcd-01-key.pem /etc/etcd/ssl/
+
+# Kept here: ca.pem, ca-key.pem, ca-config.json, cp-etcd-01.pem, cp-etcd-01-key.pem
 rm -f *.csr *-csr.json
 ```
 
 ## Step 4 — Set the file permissions
 
 ```bash
+# etcd's directory: the public CA certificate and this host's own key pair.
 chown etcd:etcd /etc/etcd/ssl/*
 chmod 644 /etc/etcd/ssl/*.pem
 chmod 600 /etc/etcd/ssl/*-key.pem     # after the 644 — key files match *.pem too
+
+# The CA's directory: root's alone, and not traversable by anyone else.
+chown -R root:root /root/pki/etcd-ca
+chmod 700 /root/pki/etcd-ca
+chmod 600 /root/pki/etcd-ca/ca-key.pem
 ```
 
-Two tightenings worth making, neither of which breaks anything:
+One more tightening, once erawan has minted tenant certificates on this host —
+they are live credentials for other people's clusters:
 
 ```bash
-# etcd never reads the CA key; only erawan does, and it operates as root.
-chown root:root /etc/etcd/ssl/ca-key.pem && chmod 600 /etc/etcd/ssl/ca-key.pem
-
-# Once erawan has minted tenant certificates here (they are live credentials
-# for other people's clusters):
 chown -R root:root /etc/etcd/ssl/erawan-clients && chmod 700 /etc/etcd/ssl/erawan-clients
 ```
 
-Left as `etcd:etcd`, a compromise of the etcd service account is a compromise of
-the CA and of every tenant credential ever issued from it. Note also that
-re-running the wildcard `chown` later re-takes the `erawan-clients` directory
-for the etcd user, so once tenants exist on this host, set ownership per file
-rather than sweeping the directory.
+Keeping the CA out of `/etc/etcd/ssl` is what makes that first wildcard `chown`
+safe to re-run: it can no longer hand the CA key to the etcd service account,
+because the key is not in the directory being swept. It can still re-take
+`erawan-clients`, so once tenants exist here, set ownership per file rather than
+sweeping the directory.
+
+Erawan writes two things of its own into `/etc/etcd/ssl`, both as root, and
+neither needs creating by hand: the minted pairs under `erawan-clients/<engine>/`
+and the serial counter `ca.srl` it keeps for them. That counter is erawan's
+alone — cfssl gives every certificate it signs a random serial and keeps no
+counter — so the two never have to be reconciled.
 
 ## Step 5 — Write `/etc/etcd/etcd.conf.yml`
 
@@ -347,12 +380,31 @@ On the erawan host (`.envrc` / the service environment):
 ```bash
 SHARED_CONTROL_PLANE=10.10.3.66
 CONTROL_PLANE_ETCD_ROOT_PASSWORD=<root-pw>     # start-up fails without it
+
+# Required with the CA layout in this document. The built-in default is
+# /etc/etcd/ssl/ca-key.pem, and step 3 deliberately did not put it there.
+CONTROL_PLANE_ETCD_CA_KEY=/root/pki/etcd-ca/ca-key.pem
+
 # Defaults shown; set only if you changed the names above
 # CONTROL_PLANE_ETCD_CLIENT_PORT=2379
 # CONTROL_PLANE_ETCD_CACERT=/etc/etcd/ssl/ca.pem
 # CONTROL_PLANE_ETCD_CERT=/etc/etcd/ssl/cp-etcd-01.pem
 # CONTROL_PLANE_ETCD_KEY=/etc/etcd/ssl/cp-etcd-01-key.pem
+# CONTROL_PLANE_ETCD_CLIENT_CERT=true                     # leave on: step 5 set client-cert-auth
+# CONTROL_PLANE_ETCD_CLIENT_CERT_DIR=/etc/etcd/ssl/erawan-clients
 ```
+
+`CONTROL_PLANE_ETCD_CA_KEY` is read once at start-up, so it needs a restart of
+the erawan service, not just an edit. Getting it wrong fails late and only
+partly: the tenant's etcd role, user and key prefix are created first, the
+signing step is what fails, and re-running after the fix converges the objects
+already there rather than tripping over them.
+
+Do **not** answer that failure with `CONTROL_PLANE_ETCD_CLIENT_CERT=false`. With
+`client-cert-auth: true` from step 5, a node presenting no certificate has its
+TLS handshake aborted — `tlsv13 alert certificate required` — and Patroni sits
+on `waiting on etcd` forever. That switch is for a control plane that does not
+require client certificates at all.
 
 Restart erawan and deploy a PostgreSQL cluster. The `control_plane_dcs` step
 creates the tenant's role, user and key prefix, mints its client certificate
@@ -485,8 +537,9 @@ etcdctl --user "root:<root-pw>" member add cp-etcd-02 \
   --peer-urls=https://10.10.3.67:2380
 ```
 
-Build the new host through steps 1–6, copying the CA in at step 2 rather than
-creating one, and give its `etcd.conf.yml` the whole membership and
+Build the new host through steps 1–6, copying `ca.pem`, `ca-key.pem` and
+`ca-config.json` into its `/root/pki/etcd-ca` at step 2 rather than creating a
+CA there, and give its `etcd.conf.yml` the whole membership and
 `initial-cluster-state: existing` — a second member that bootstraps as `new`
 forms its own one-member cluster instead of joining:
 
@@ -517,6 +570,16 @@ cloud-init in
 is built around that: `etcd-regen-config.service` detects the private IP at
 boot, re-signs the server certificate for it, re-renders `etcd.conf.yml` from
 `/etc/etcd/etcd.conf.yml.j2` and restarts etcd.
+
+**That image expects the CA in `/etc/etcd/ssl`, not in `/root/pki/etcd-ca`.**
+Both `etcd-regen-config.service` and `etcd-make-ca.sh` look for `ca.pem`,
+`ca-key.pem` and `ca-config.json` there, and the regen service exits with
+`CA files ... not found` when they are absent — so a host built by hand from
+this document does not get boot-time re-signing until the CA is put where the
+image looks. Pick one and know which you are on: keep the CA in `/etc/etcd/ssl`
+if you want that automation (and leave `CONTROL_PLANE_ETCD_CA_KEY` at its
+default), or keep the layout in this document and re-sign by hand as below.
+Erawan is indifferent either way — it reads `CONTROL_PLANE_ETCD_CA_KEY`.
 
 Which path you take depends on one question: **does `/var/lib/etcd/member` hold
 tenants?** A clone that has never served anything is re-addressed by wiping it.
@@ -566,7 +629,7 @@ address is in flux — and keep the **old** address until the whole fleet has
 moved off it:
 
 ```bash
-cd /etc/etcd/ssl
+cd /root/pki/etcd-ca
 cat > /tmp/$NODE-csr.json <<EOF
 {
   "CN": "$NODE",
@@ -579,9 +642,12 @@ cfssl gencert -ca=ca.pem -ca-key=ca-key.pem \
   -config=ca-config.json -profile=server /tmp/$NODE-csr.json | cfssljson -bare $NODE
 rm -f /tmp/$NODE-csr.json $NODE.csr
 
-chown root:etcd $NODE.pem $NODE-key.pem
-chmod 644 $NODE.pem
-chmod 640 $NODE-key.pem
+# Signed in the CA directory, then published to the one etcd reads.
+cp $NODE.pem $NODE-key.pem /etc/etcd/ssl/
+
+chown root:etcd /etc/etcd/ssl/$NODE.pem /etc/etcd/ssl/$NODE-key.pem
+chmod 644 /etc/etcd/ssl/$NODE.pem
+chmod 640 /etc/etcd/ssl/$NODE-key.pem
 ```
 
 Then both files that carry the address, and the marker that is keyed to it:
@@ -726,7 +792,7 @@ than that loses its leader lock and holds its primary read-only until it can.
 | One tenant's certificate | Delete the pair under `/etc/etcd/ssl/erawan-clients/<engine>/` and re-run any deploy, start/recover or add-member for that cluster. The next run mints a new pair (stamped with the issue time) and installs it | That tenant |
 | One tenant's password | Rotate on the erawan side; provisioning converges the etcd user's password on the next run | That tenant |
 | Server certificate | Back up the old pair, re-sign (step 3), `systemctl restart etcd` | etcd restarts — a few seconds of DCS outage for every tenant. Patroni's `ttl` is 30s, so time it deliberately |
-| CA | Effectively a rebuild: every server and tenant certificate signed by it stops being trusted, and nodes hold the old `ca.pem` until their next provisioning run | Everything |
+| CA | Effectively a rebuild: every server and tenant certificate signed by it stops being trusted, and nodes hold the old `ca.pem` until their next provisioning run. Re-issue in `/root/pki/etcd-ca`, then re-copy `ca.pem` to `/etc/etcd/ssl` | Everything |
 
 Any change to `/etc/etcd/etcd.conf.yml` also needs an etcd restart, with the
 same shared blast radius.
@@ -741,6 +807,8 @@ indexed in [pgsql.md → Symptom index](pgsql.md#symptom-index). Control-plane-s
 | `curl .../v3/auth/authenticate` returns `404` | `enable-grpc-gateway` is off, or etcd did not start from the config file you edited (`systemctl cat etcd`, and check the `--config-file` override is in effect) |
 | `etcd.service` fails with `member ... has already been bootstrapped` | Leftover data in `/var/lib/etcd` from an earlier incarnation. `/var/lib/etcd/default` is the package's own auto-start and is safe to delete; `/var/lib/etcd/member` is this control plane's real state and is not |
 | The host's IP changed and etcd no longer serves | The certificate's SANs, the raft membership record and every URL in `etcd.conf.yml` still name the old address. Follow [changing the control plane's private IP](#changing-the-control-planes-private-ip); do **not** clear the data directory to make it start |
+| Deploy fails with `... ca-key.pem does not exist on the control plane, so a client certificate cannot be signed` | Erawan is looking for the CA key where it is not. Set `CONTROL_PLANE_ETCD_CA_KEY` to the real path (step 9) and restart erawan. The tenant's role and user were already created and converge on the re-run |
+| The CA expires before the certificates it signed | `ca-csr.json` had no `ca.expiry`, so cfssl gave the CA 5 years while tenant certificates get 3650 days. `openssl x509 -in /root/pki/etcd-ca/ca.pem -noout -dates` — compare against a minted pair under `/etc/etcd/ssl/erawan-clients/` |
 | `cfssl: command not found` | `apt install -y golang-cfssl` |
 | Provisioning warns `authentication is not enabled` | Step 8 was skipped |
 | Provisioning fails on `invalid user ID or password` for root | `CONTROL_PLANE_ETCD_ROOT_PASSWORD` does not match this host's root user |

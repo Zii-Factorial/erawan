@@ -513,6 +513,7 @@ CN and confirms the gateway is live.
 | `tlsv13 alert certificate required` | Node has no client certificate; check `CONTROL_PLANE_ETCD_CLIENT_CERT` |
 | `certificate verify failed` / IP address mismatch | Control-plane IP missing from the server certificate's SANs |
 | Deploy warns `authentication is not enabled` | `auth enable` never run — requirement 4 |
+| Deploy fails on `ca-key.pem does not exist on the control plane` | The CA key is not where erawan looks; point `CONTROL_PLANE_ETCD_CA_KEY` at it and restart erawan ([control-plane.md](control-plane.md#step-9--point-erawan-at-it)) |
 | `invalid user ID or password` | Tenant user dropped out of band, or the job's DCS password no longer matches |
 
 Changing any of the above needs an etcd restart, which briefly drops the DCS for

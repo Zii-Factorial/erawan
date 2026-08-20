@@ -331,8 +331,8 @@
   tags: ["cluster_bootstrap"]
 
 # block/rescue ensures journal is collected whether the port-open wait or the
-# leader-API poll times out first.
-- name: Bootstrap Patroni primary and verify leader election
+# cluster-state poll times out first.
+- name: Bootstrap Patroni primary and verify the cluster has a leader
   when: inventory_hostname in groups['pgsql_primary']
   tags: ["cluster_bootstrap"]
   block:
@@ -343,15 +343,53 @@
         state: started
         timeout: "{{ patroni_port_open_timeout }}"
 
-    - name: Wait for Patroni leader API on primary
+    # What bootstrap has to establish is that the CLUSTER has a leader and that
+    # this node has joined it — not that this particular node won the election.
+    #
+    # primary_ip is the *stored* primary from the portal spec, and nothing
+    # updates it after a failover. A scale operation reboots that VM, the lock
+    # expires, another member wins it, and on the next start this node correctly
+    # follows the live leader rather than fencing it. Polling /leader here (200
+    # only on the lock holder) called that healthy cluster a failure — after
+    # burning the whole retry budget, five minutes, on a cluster that was
+    # already up. verify_cluster discovers the leader for the same reason.
+    #
+    # /cluster is served from the DCS by any member, so this stays on the host
+    # the play is already on. `host` is the member's IP, as in verify_cluster.
+    - name: Wait for a leader to be elected and this node to join the cluster
       ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/leader"
+        url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/cluster"
         return_content: true
-      register: _patroni_leader
-      until: _patroni_leader.status == 200
+      register: _patroni_cluster
+      until: >-
+        ((_patroni_cluster.json | default({})).members | default([])
+         | selectattr('role', 'in', ['leader', 'standby_leader'])
+         | list | length > 0)
+        and
+        ((_patroni_cluster.json | default({})).members | default([])
+         | selectattr('host', 'equalto', ansible_host)
+         | selectattr('state', 'in', ['running', 'streaming'])
+         | list | length > 0)
       retries: "{{ patroni_leader_retries }}"
       delay: "{{ patroni_leader_delay }}"
       changed_when: false
+
+    # Which member actually holds the lock, for the log and for anything after
+    # this role that would otherwise assume it is primary_ip.
+    - name: Record the elected leader
+      ansible.builtin.set_fact:
+        patroni_leader_ip: >-
+          {{ (_patroni_cluster.json | default({})).members | default([])
+             | selectattr('role', 'in', ['leader', 'standby_leader'])
+             | map(attribute='host', default=primary_ip)
+             | first | default(primary_ip) }}
+
+    - name: Report the elected leader
+      ansible.builtin.debug:
+        msg: >-
+          Cluster leader is {{ patroni_leader_ip }}
+          {{ '(the stored primary)' if patroni_leader_ip == primary_ip
+             else '— the stored primary ' ~ primary_ip ~ ' is a replica of it' }}
   rescue:
     - name: Collect Patroni journal on primary bootstrap failure
       ansible.builtin.command:
@@ -363,7 +401,11 @@
     - name: Fail with Patroni log context
       ansible.builtin.fail:
         msg: |
-          Patroni failed to become leader on {{ inventory_hostname }}.
+          The cluster did not reach a healthy state from {{ inventory_hostname }}:
+          either no member won the leader lock, or this node never joined as a
+          running member. A node reporting itself a secondary following another
+          leader is NOT this failure — that is a healthy cluster.
+          Last Patroni cluster view: {{ (_patroni_cluster | default({})).json | default('(not reached)') }}
           Last 80 Patroni journal lines:
           {{ _patroni_journal.stdout | default('(no journal output)') }}
 

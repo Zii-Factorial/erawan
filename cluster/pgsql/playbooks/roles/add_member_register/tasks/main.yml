@@ -86,15 +86,32 @@
 - name: Verify the cluster has a Patroni leader before adding a member
   tags: ["add_member_register"]
   block:
-    - name: Wait for Patroni leader on primary
+    # Asks whether the CLUSTER has a leader, not whether primary_ip is it: the
+    # stored primary is a replica after any failover (a vertical scale reboots
+    # that VM), and a replica is still a fine place to ask — /cluster is served
+    # from the DCS by any member. Gating on /leader here rejected a healthy
+    # cluster that simply had a different leader.
+    - name: Wait for the cluster to report a Patroni leader
       ansible.builtin.uri:
-        url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/leader"
+        url: "http://{{ primary_ip }}:{{ patroni_rest_port }}/cluster"
         return_content: true
       register: _leader_gate
-      until: _leader_gate.status == 200
+      until: >-
+        (_leader_gate.json | default({})).members | default([])
+        | selectattr('role', 'in', ['leader', 'standby_leader'])
+        | selectattr('state', 'in', ['running', 'streaming'])
+        | list | length > 0
       retries: 30
       delay: 2
       changed_when: false
+
+    - name: Record which member the replica will be cloned from
+      ansible.builtin.set_fact:
+        patroni_leader_ip: >-
+          {{ (_leader_gate.json | default({})).members | default([])
+             | selectattr('role', 'in', ['leader', 'standby_leader'])
+             | map(attribute='host', default=primary_ip)
+             | first | default(primary_ip) }}
   rescue:
     - name: Collect Patroni journal on missing leader
       ansible.builtin.command:
@@ -106,8 +123,9 @@
     - name: Fail fast because the cluster has no leader to clone from
       ansible.builtin.fail:
         msg: |
-          Cannot add a member: the cluster has no Patroni leader (checked
-          http://{{ primary_ip }}:{{ patroni_rest_port }}/leader for 60s).
+          Cannot add a member: no member of the cluster holds the Patroni
+          leader lock in a running state (checked
+          http://{{ primary_ip }}:{{ patroni_rest_port }}/cluster for 60s).
           PostgreSQL on the primary is most likely down (common after a node
           reboot/vertical scale) — run the start/recover API for this cluster
           first, then retry add-member.
