@@ -667,12 +667,36 @@
         state: started
         timeout: "{{ patroni_replica_port_open_timeout }}"
 
-    - name: Wait for Patroni replica API on standbys
+    # The mirror of the primary wait above, and wrong for the same reason if
+    # written as `/replica` returns 200: that endpoint answers 200 only on a
+    # node that is NOT the leader. After a failover the roles in the stored
+    # spec are simply swapped — the node filed here as standby_1 holds the
+    # leader lock and the stored primary streams from it — and a cluster in
+    # that state is healthy, not broken. Demanding a replica role here failed
+    # the recover of a cluster whose own /replica body showed
+    # `"role": "primary"` with the other node streaming `sync`.
+    #
+    # It also cannot pass by waiting, so the whole retry budget is spent before
+    # the failure: a deploy looks fast only because the stored primary really
+    # is the leader on a first deploy, which stops being true after any scale.
+    #
+    # So this asserts what bootstrap actually needs on every node, whatever
+    # role it currently holds: the cluster has a leader, and this node is a
+    # running member of it. Same condition as the primary, deliberately.
+    - name: Wait for this node to join a cluster that has a leader
       ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/replica"
+        url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/cluster"
         return_content: true
       register: _patroni_replica
-      until: _patroni_replica.status == 200
+      until: >-
+        ((_patroni_replica.json | default({})).members | default([])
+         | selectattr('role', 'in', ['leader', 'standby_leader'])
+         | list | length > 0)
+        and
+        ((_patroni_replica.json | default({})).members | default([])
+         | selectattr('host', 'equalto', ansible_host)
+         | selectattr('state', 'in', ['running', 'streaming'])
+         | list | length > 0)
       retries: "{{ patroni_replica_retries }}"
       delay: "{{ patroni_replica_delay }}"
       changed_when: false
@@ -687,7 +711,10 @@
     - name: Fail with Patroni log context on standbys
       ansible.builtin.fail:
         msg: |
-          Patroni failed to reach replica state on {{ inventory_hostname }}.
+          {{ inventory_hostname }} never became a running member of a cluster
+          with a leader. Note that holding the leader lock is NOT this failure:
+          after a failover the stored roles are swapped and that is healthy.
+          Last Patroni cluster view: {{ (_patroni_replica | default({})).json | default('(not reached)') }}
           Last 80 Patroni journal lines:
           {{ _patroni_standby_journal.stdout | default('(no journal output)') }}
 
