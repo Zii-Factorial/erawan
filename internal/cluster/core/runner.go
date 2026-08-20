@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -174,7 +175,47 @@ func AnsibleRun(ctx context.Context, spec AnsibleSpec) (result StepResult) {
 		return
 	}
 	result.Message = fmt.Sprintf("ansible step failed: %v", err)
+	if hint := ExplainAnsibleFailure(result.Stdout + result.Stderr); hint != "" {
+		result.Message += " — " + hint
+	}
 	return
+}
+
+/**
+ * ExplainAnsibleFailure turns a failure whose real cause is legible in the
+ * output, but not in the exit code, into a sentence that names it.
+ *
+ * The case that motivates it: a node going down mid-run reports only
+ * UNREACHABLE, which reads as a network or SSH-credential problem and gets
+ * investigated as one. It is neither — sshd is refusing logins because the
+ * machine is shutting down, and something outside erawan ordered that.
+ * CloudStack-side VM stops (a scale or restart flow acting on a cluster while
+ * one of its jobs is still running) bypass the member-op lock entirely, so
+ * erawan cannot serialise against them and can only report them accurately.
+ *
+ * Params:
+ *   output string - combined stdout and stderr of the ansible run
+ *
+ * Returns:
+ *   string - a one-sentence explanation, or "" when nothing is recognised
+ */
+func ExplainAnsibleFailure(output string) string {
+	// pam_nologin's wording differs slightly by distro, so match on the parts
+	// that do not: the nologin module itself, and the sentence it prints.
+	shutdownSignatures := []string{
+		"System is going down",
+		"pam_nologin",
+		"Unprivileged users are not permitted to log in",
+	}
+	for _, sig := range shutdownSignatures {
+		if strings.Contains(output, sig) {
+			return "a target node was shutting down while this step ran, so SSH was refused (pam_nologin) — " +
+				"an external stop, reboot or scale of the VM raced this job. " +
+				"Erawan cannot see CloudStack-side VM operations and cannot lock against them: " +
+				"wait for the VM operation to finish, then re-run this job."
+		}
+	}
+	return ""
 }
 
 // cappedBuffer is a write-capped buffer that preserves both ends of the
@@ -248,4 +289,58 @@ func (b *cappedBuffer) String() string {
 		s += string(b.tail)
 	}
 	return strings.TrimSpace(s)
+}
+
+/**
+ * WaitForSSH blocks until every host accepts a TCP connection on port, or the
+ * budget runs out. It is a liveness probe, not an authentication check: a node
+ * that answers here may still be finishing its boot, which is what the
+ * playbooks own wait_for_connection covers.
+ *
+ * Its purpose is the window a vertical scale opens. CloudStack stops the VM to
+ * resize it, so a cluster restart issued in that window finds the node going
+ * down (or already down) through no fault of the cluster. Waiting for the VM to
+ * come back and running the step again is the correct response to that, and the
+ * recovery steps are idempotent precisely so it can be.
+ *
+ * Params:
+ *   ctx context.Context - context carrying cancellation signals and deadlines
+ *   hosts []string - addresses to probe
+ *   port int - TCP port to probe (the cluster SSH port)
+ *   budget time.Duration - how long to keep trying before giving up
+ *
+ * Returns:
+ *   error - nil once every host answers, otherwise the reason the wait ended
+ */
+func WaitForSSH(ctx context.Context, hosts []string, port int, budget time.Duration) error {
+	if len(hosts) == 0 {
+		return nil
+	}
+	if port <= 0 {
+		port = 22
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		pending := ""
+		for _, h := range hosts {
+			addr := net.JoinHostPort(h, fmt.Sprint(port))
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				pending = h
+				break
+			}
+			_ = conn.Close()
+		}
+		if pending == "" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s did not accept connections on port %d within %s", pending, port, budget)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
 }

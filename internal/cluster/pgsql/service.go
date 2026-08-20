@@ -46,6 +46,13 @@ const controlPlaneDCSStep = "control_plane_dcs"
 // created seconds ago (add-member), hence minutes rather than seconds.
 const dcsExecTimeout = 10 * time.Minute
 
+// scaleRebootWait bounds how long a recovery step waits for a node that went
+// down mid-run to accept connections again. A vertical scale is a stop, an
+// offering change and a start, which is minutes rather than seconds — but a
+// node that is not back within this is down for a reason a retry will not fix,
+// and the job should say so instead of hanging.
+const scaleRebootWait = 5 * time.Minute
+
 // defaultMaxConcurrentJobs bounds concurrent background jobs until configured.
 const defaultMaxConcurrentJobs = 4
 
@@ -572,13 +579,36 @@ func (s *Service) executeRecovery(ctx context.Context, recoveryJob *Job, deployJ
 		s.updateJobProgress(recoveryJob)
 		_ = s.store.Save(recoveryJob)
 
-		res := s.runDeploy(ctx, runConfig{
+		cfg := runConfig{
 			jobID:   deployJob.ID,
 			spec:    deployJob.Request,
 			secret:  secret,
 			step:    st,
 			timeout: execTimeoutForTag(st.Tag, timeout),
-		})
+		}
+		res := s.runDeploy(ctx, cfg)
+
+		// A vertical scale stops the VM to resize it, and the cluster restart
+		// that follows a scale is routinely issued before CloudStack has
+		// finished — so a node goes down underneath a running step and Ansible
+		// reports only UNREACHABLE (pam_nologin: "System is going down").
+		//
+		// That is a race, not a broken cluster, and erawan cannot lock against
+		// it: CloudStack VM operations never reach the member-op lock. What it
+		// can do is not fail a restart that merely arrived early. Every
+		// recovery step is idempotent by design, so wait for the node to come
+		// back and run the step once more.
+		//
+		// Deliberately narrow: only the shutdown signature retries, only once,
+		// and only on the recovery path. An ordinary task failure, or an
+		// UNREACHABLE from bad credentials, still fails immediately.
+		if res.Status != JobStatusCompleted &&
+			core.ExplainAnsibleFailure(res.Stdout+res.Stderr) != "" {
+			nodes := append([]string{deployJob.Request.PrimaryIP}, deployJob.Request.StandbyIPs...)
+			if err := core.WaitForSSH(ctx, nodes, deployJob.Request.SSHPort, scaleRebootWait); err == nil {
+				res = s.runDeploy(ctx, cfg)
+			}
+		}
 		recoveryJob.Steps = append(recoveryJob.Steps, res)
 
 		if res.Status != JobStatusCompleted {

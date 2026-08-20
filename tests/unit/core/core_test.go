@@ -4,6 +4,7 @@ package core_test
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -323,7 +324,7 @@ func TestStoreRejectsPathTraversalJobIDs(t *testing.T) {
 		"short",
 		"",
 		"AABBCCDDEE1122334455AABB", // uppercase not allowed
-		id1 + "extra",             // too long
+		id1 + "extra",              // too long
 	}
 	for _, jobID := range bad {
 		if _, err := s.Load(jobID); err == nil {
@@ -451,5 +452,79 @@ func TestEnsureKnownHostsFailsFastForUnreachableHost(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "127.0.0.1") {
 		t.Fatalf("expected error to name the host, got %q", err)
+	}
+}
+
+// A node going down mid-run surfaces only as UNREACHABLE, which reads as a
+// network or credential problem. These are the lines that actually explain it,
+// taken from a real recover that a CloudStack-side VM stop raced.
+func TestExplainAnsibleFailureNamesAMidRunShutdown(t *testing.T) {
+	realOutput := `<10.10.0.238> (255, b'', b'mux_client_request_session: read from master failed: Broken pipe\r\n` +
+		`System is going down. Unprivileged users are not permitted to log in anymore. ` +
+		`For technical details, see pam_nologin(8).\n\nConnection closed by 10.10.0.238 port 22\r\n')
+fatal: [standby_1]: UNREACHABLE!`
+
+	got := core.ExplainAnsibleFailure(realOutput)
+	if got == "" {
+		t.Fatal("expected a mid-run shutdown to be explained, got no explanation")
+	}
+	for _, want := range []string{"shutting down", "raced this job"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("explanation %q does not mention %q", got, want)
+		}
+	}
+}
+
+func TestExplainAnsibleFailureStaysQuietOnOrdinaryFailures(t *testing.T) {
+	cases := map[string]string{
+		"task failure":     "fatal: [primary]: FAILED! => {\"msg\": \"Patroni did not reach a healthy state\"}",
+		"ssh auth failure": "fatal: [primary]: UNREACHABLE! => {\"msg\": \"Permission denied (publickey)\"}",
+		"empty":            "",
+	}
+	for name, out := range cases {
+		if got := core.ExplainAnsibleFailure(out); got != "" {
+			t.Fatalf("%s: expected no explanation, got %q", name, got)
+		}
+	}
+}
+
+func TestWaitForSSHReturnsOnceHostsAnswer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	if err := core.WaitForSSH(context.Background(), []string{"127.0.0.1"}, port, 5*time.Second); err != nil {
+		t.Fatalf("expected a listening host to satisfy the wait, got %v", err)
+	}
+}
+
+func TestWaitForSSHGivesUpOnADeadHost(t *testing.T) {
+	// Port 1 on loopback: nothing listens, so this is refused immediately and
+	// the wait must end on its own budget rather than blocking the job.
+	start := time.Now()
+	err := core.WaitForSSH(context.Background(), []string{"127.0.0.1"}, 1, 1*time.Second)
+	if err == nil {
+		t.Fatal("expected a dead host to end the wait with an error")
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("wait overran its budget: %s", elapsed)
+	}
+}
+
+func TestWaitForSSHIsANoOpWithoutHosts(t *testing.T) {
+	if err := core.WaitForSSH(context.Background(), nil, 22, time.Second); err != nil {
+		t.Fatalf("expected no hosts to be a no-op, got %v", err)
 	}
 }
