@@ -77,6 +77,85 @@
       etcdctl stdout: {{ _dcs_provision.stdout | default('(none)') | trim }}
   when: (_dcs_provision.rc | default(1)) != 0
 
+# ── Orphaned tenant state ───────────────────────────────────────────────────
+# A tenant prefix that still holds Patroni state from an earlier incarnation of
+# this cluster NAME wedges the new one permanently. Patroni only runs initdb
+# when it can take the `initialize` key; finding one already there it decides
+# the cluster exists and waits to clone from a leader instead:
+#
+#   INFO: Lock owner: None; I am node1
+#   INFO: waiting for leader to bootstrap        (forever)
+#
+# with the member stuck at role `replica`, state `stopped`. There is no leader
+# to clone from and never will be, so nothing about it resolves by waiting.
+#
+# This is specific to a shared control plane, and it is why a classic per-node
+# DCS never showed it: there, the DCS died with the VMs that held it, so a
+# redeployed cluster name always started from an empty prefix. Here the state
+# outlives the VMs — a deploy that failed after Patroni first started leaves an
+# `initialize` key behind, and every later attempt on that name inherits it.
+#
+# Two guards, both required:
+#
+#   - Only on a deploy (dcs_reset_stale_state, set by the Go runner for the
+#     deploy pipeline and never for start/recover). A recover must keep the
+#     state that its nodes' data belongs to.
+#   - Only when no member holds the leader lock. A live cluster of this name
+#     keeps everything; the run becomes a no-op rather than pulling the DCS out
+#     from under it.
+- name: Clear tenant state left by an earlier incarnation of this cluster
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    keys="$({{ dcs_etcdctl_bin }} get --prefix "$DCS_PREFIX" --keys-only | sed '/^$/d')"
+
+    if [ -z "$keys" ]; then
+      echo "prefix-empty"
+      exit 0
+    fi
+
+    # A leader key means a live cluster owns this name: leave it entirely alone.
+    if printf '%s\n' "$keys" | grep -qx "${DCS_PREFIX}leader"; then
+      echo "leader-present"
+      exit 0
+    fi
+
+    {{ dcs_etcdctl_bin }} del --prefix "$DCS_PREFIX" >/dev/null
+    printf 'stale-cleared %s\n' "$(printf '%s\n' "$keys" | wc -l)"
+  args:
+    executable: /bin/bash
+  environment: "{{ dcs_etcdctl_env }}"
+  register: _dcs_reset
+  changed_when: "'stale-cleared' in (_dcs_reset.stdout | default(''))"
+  failed_when: false
+  no_log: true
+  when: dcs_reset_stale_state | default(false) | bool
+
+# no_log above censors the module result; the marker line carries no secret.
+- name: Report what the tenant prefix held
+  ansible.builtin.debug:
+    msg: >-
+      {{ dcs_prefix }}:
+      {{ 'was empty — nothing to clear'
+         if 'prefix-empty' in (_dcs_reset.stdout | default('')) else
+         ('a live cluster holds the leader lock — left untouched'
+          if 'leader-present' in (_dcs_reset.stdout | default('')) else
+          'cleared ' ~ ((_dcs_reset.stdout | default('')).split(' ') | last)
+          ~ ' orphaned key(s) from an earlier incarnation, so Patroni can bootstrap') }}
+  when:
+    - dcs_reset_stale_state | default(false) | bool
+    - (_dcs_reset.rc | default(1)) == 0
+
+- name: Fail with the tenant prefix reset error
+  ansible.builtin.fail:
+    msg: |
+      Inspecting {{ dcs_prefix }} on the control plane failed, so orphaned
+      Patroni state could not be ruled out. etcdctl stderr:
+      {{ _dcs_reset.stderr | default('(none)') | trim }}
+  when:
+    - dcs_reset_stale_state | default(false) | bool
+    - (_dcs_reset.rc | default(1)) != 0
+
 # ── Per-tenant client certificate ───────────────────────────────────────────
 # Required by an etcd running with client-cert-auth: true, which rejects the
 # TLS handshake outright when the client presents no certificate — the failure

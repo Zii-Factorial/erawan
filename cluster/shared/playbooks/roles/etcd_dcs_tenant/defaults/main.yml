@@ -62,6 +62,13 @@ dcs_root_user: root
 # <dcs_namespace><dcs_scope>/ and is granted nothing outside it.
 dcs_namespace: /db/patroni/
 
+# Authorises provisioning to drop a tenant prefix that still holds Patroni
+# state from an earlier cluster of this name. The Go runner sets it true for the
+# deploy pipeline only; start/recover leaves it false so a cluster's own state
+# is never cleared out from under its data. Even when true it is a no-op unless
+# the prefix is orphaned — see the reset task in tasks/provision.yml.
+dcs_reset_stale_state: false
+
 # Nodes allowed to reach the control plane's client port (UFW source scoping).
 dcs_client_ips: []
 

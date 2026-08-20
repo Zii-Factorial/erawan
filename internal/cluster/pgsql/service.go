@@ -1417,10 +1417,14 @@ func (s *Service) executeFrom(ctx context.Context, job *Job, startIndex int, sec
 		}
 
 		res := s.runDeploy(ctx, runConfig{
-			jobID:         job.ID,
-			spec:          job.Request,
-			secret:        secret,
-			step:          st,
+			jobID:  job.ID,
+			spec:   job.Request,
+			secret: secret,
+			step:   st,
+			// This is the deploy pipeline (a first run or a resume of one), the
+			// only caller allowed to clear an orphaned tenant prefix on the
+			// control plane. executeRecovery deliberately leaves it false.
+			freshDeploy:   true,
 			timeout:       execTimeoutForTag(st.Tag, timeout),
 			resetHostKeys: resetHostKeys,
 		})
@@ -1521,6 +1525,7 @@ func (s *Service) runDCSProvisionFor(ctx context.Context, cfg runConfig) StepRes
 		clientIPs:     append([]string{cfg.spec.PrimaryIP}, cfg.spec.StandbyIPs...),
 		step:          cfg.step,
 		timeout:       cfg.timeout,
+		freshDeploy:   cfg.freshDeploy,
 		resetHostKeys: cfg.resetHostKeys,
 	})
 }

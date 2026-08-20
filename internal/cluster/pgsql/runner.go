@@ -244,11 +244,16 @@ func (r *Runner) SetDebug(verbosity int, streamLogs bool, maxOutputChars int) {
 }
 
 type runConfig struct {
-	jobID         string
-	spec          StoredSpec
-	secret        SecretInput
-	step          step
-	timeout       time.Duration
+	jobID   string
+	spec    StoredSpec
+	secret  SecretInput
+	step    step
+	timeout time.Duration
+	// freshDeploy marks a run of the deploy pipeline (including a resume of
+	// one) as opposed to start/recover. Only a deploy is entitled to clear
+	// Patroni state left on the shared control plane by an earlier cluster of
+	// the same name; a recover must keep the state its nodes' data belongs to.
+	freshDeploy   bool
 	resetHostKeys bool
 }
 
@@ -267,13 +272,16 @@ type memberRunConfig struct {
 // granted the control plane's client port); revokeIPs are nodes that just left
 // and must lose that grant.
 type dcsRunConfig struct {
-	jobID         string
-	spec          StoredSpec
-	secret        SecretInput
-	clientIPs     []string
-	revokeIPs     []string
-	step          step
-	timeout       time.Duration
+	jobID     string
+	spec      StoredSpec
+	secret    SecretInput
+	clientIPs []string
+	revokeIPs []string
+	step      step
+	timeout   time.Duration
+	// See runConfig.freshDeploy. Passed to the provisioning playbook as
+	// dcs_reset_stale_state.
+	freshDeploy   bool
 	resetHostKeys bool
 }
 
@@ -471,6 +479,9 @@ func (r *Runner) runDCS(ctx context.Context, cfg dcsRunConfig, playbook, workspa
 	extraVars := r.controlPlane.DCSVars(target)
 	extraVars["deployment_job_id"] = cfg.jobID
 	extraVars["cluster_name"] = cfg.spec.ClusterName
+	// Authorises the playbook to drop an orphaned tenant prefix — see
+	// runConfig.freshDeploy and the reset task in the etcd_dcs_tenant role.
+	extraVars["dcs_reset_stale_state"] = cfg.freshDeploy
 
 	return core.AnsibleRun(ctx, core.AnsibleSpec{
 		Bin:             r.ansibleBin,
