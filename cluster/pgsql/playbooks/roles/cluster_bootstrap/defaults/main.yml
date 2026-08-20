@@ -14,6 +14,12 @@ postgres_port: 5432
 patroni_port_open_timeout: 180
 patroni_leader_retries: 150
 patroni_leader_delay: 2
+# Share of the budget above spent before the state is judged. A cluster that
+# cannot elect a leader is diagnosable well inside 60 s, and spending the other
+# four minutes on it only delays the same answer — see the fail-fast in
+# tasks/main.yml. Everything a slow bootstrap passes through is still waited on
+# for the full ceiling.
+patroni_leader_grace_retries: 30
 patroni_replica_port_open_timeout: 120
 patroni_replica_retries: 150
 patroni_replica_delay: 2

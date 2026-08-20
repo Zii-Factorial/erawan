@@ -356,6 +356,11 @@
     #
     # /cluster is served from the DCS by any member, so this stays on the host
     # the play is already on. `host` is the member's IP, as in verify_cluster.
+    #
+    # The wait is split into a grace poll and the rest of the budget so a cluster that
+    # provably cannot elect a leader is called after ~60s instead of five
+    # minutes. failed_when: false keeps an exhausted grace poll from ending the
+    # block — the diagnosis below decides whether waiting longer is useful.
     - name: Wait for a leader to be elected and this node to join the cluster
       ansible.builtin.uri:
         url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/cluster"
@@ -370,9 +375,85 @@
          | selectattr('host', 'equalto', ansible_host)
          | selectattr('state', 'in', ['running', 'streaming'])
          | list | length > 0)
-      retries: "{{ patroni_leader_retries }}"
+      retries: "{{ patroni_leader_grace_retries }}"
       delay: "{{ patroni_leader_delay }}"
       changed_when: false
+      failed_when: false
+
+    - name: Summarise the cluster view
+      ansible.builtin.set_fact:
+        _cv_members: "{{ (_patroni_cluster.json | default({})).members | default([]) }}"
+
+    # `stopped` is Patroni reporting that it has DECIDED not to start Postgres.
+    # It is none of the states a slow bootstrap passes through (`initializing
+    # new cluster`, `starting`, `creating replica`) and none of the states a
+    # failed start reports (`start failed`, `crashed`) — it is the signature of
+    # a node that believes the cluster is already initialised in the DCS and is
+    # waiting to clone from a leader. With no leader in the member list there is
+    # nothing to clone from and nothing that resolves by waiting, so the rest of
+    # the budget would buy the same answer four minutes later.
+    #
+    # The usual cause is DCS state left behind by an earlier incarnation of the
+    # same cluster name: the tenant prefix still holds `initialize` (and a
+    # system identifier that does not match this node's fresh data directory),
+    # so Patroni refuses to bootstrap over it. Nothing clears that prefix except
+    # the DCS cleanup endpoint.
+    - name: Diagnose a cluster that cannot elect a leader
+      ansible.builtin.set_fact:
+        _bootstrap_diagnosis: >-
+          No member holds the leader lock and this node reports state
+          `stopped` — Patroni is up and reading the DCS, but has decided not to
+          start PostgreSQL and has no leader to clone from. On a cluster this
+          size nothing else can take the lock, so this does not resolve by
+          waiting. The usual cause is DCS state left over from an earlier
+          cluster of the same name: check
+          `etcdctl get --prefix {{ patroni_namespace }}{{ patroni_scope }}/ --keys-only`
+          {{ 'on the shared control plane' if (erawan_dcs_control_plane | bool)
+             else 'against this node etcd' }}
+          for an `initialize` key with no `leader` beside it, against a node
+          whose data directory is empty. Clearing that prefix
+          {{ '(the DELETE /cluster/pgsql/dcs endpoint)' if (erawan_dcs_control_plane | bool)
+             else '(etcdctl del --prefix, on a cluster that is provably dead)' }}
+          lets the next deploy bootstrap. If the data directory is NOT empty,
+          the journal below is the authority — treat this as a PostgreSQL start
+          failure instead.
+      when:
+        - (_cv_members | selectattr('role', 'in', ['leader', 'standby_leader'])
+                       | list | length) == 0
+        - (_cv_members | selectattr('host', 'equalto', ansible_host)
+                       | selectattr('state', 'equalto', 'stopped')
+                       | list | length) > 0
+
+    - name: Fail fast on a cluster that cannot elect a leader
+      ansible.builtin.fail:
+        msg: "{{ _bootstrap_diagnosis }}"
+      when: _bootstrap_diagnosis is defined
+
+    # Still moving, or in a state that a slow node legitimately passes through:
+    # spend what is left of the ceiling before giving up.
+    - name: Wait out the rest of the leader-election budget
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ patroni_rest_port }}/cluster"
+        return_content: true
+      register: _patroni_cluster
+      until: >-
+        ((_patroni_cluster.json | default({})).members | default([])
+         | selectattr('role', 'in', ['leader', 'standby_leader'])
+         | list | length > 0)
+        and
+        ((_patroni_cluster.json | default({})).members | default([])
+         | selectattr('host', 'equalto', ansible_host)
+         | selectattr('state', 'in', ['running', 'streaming'])
+         | list | length > 0)
+      retries: "{{ [(patroni_leader_retries | int) - (patroni_leader_grace_retries | int), 1] | max }}"
+      delay: "{{ patroni_leader_delay }}"
+      changed_when: false
+      when: >-
+        not ((_cv_members | selectattr('role', 'in', ['leader', 'standby_leader'])
+                          | list | length > 0)
+             and (_cv_members | selectattr('host', 'equalto', ansible_host)
+                             | selectattr('state', 'in', ['running', 'streaming'])
+                             | list | length > 0))
 
     # Which member actually holds the lock, for the log and for anything after
     # this role that would otherwise assume it is primary_ip.
@@ -401,10 +482,14 @@
     - name: Fail with Patroni log context
       ansible.builtin.fail:
         msg: |
+          {% if _bootstrap_diagnosis is defined -%}
+          {{ _bootstrap_diagnosis }}
+          {%- else -%}
           The cluster did not reach a healthy state from {{ inventory_hostname }}:
           either no member won the leader lock, or this node never joined as a
           running member. A node reporting itself a secondary following another
           leader is NOT this failure — that is a healthy cluster.
+          {%- endif %}
           Last Patroni cluster view: {{ (_patroni_cluster | default({})).json | default('(not reached)') }}
           Last 80 Patroni journal lines:
           {{ _patroni_journal.stdout | default('(no journal output)') }}
